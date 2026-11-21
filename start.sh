@@ -50,7 +50,7 @@ trap cleanup SIGINT SIGTERM EXIT
 rm -rf "$FRONTEND_DIR/.next" 2>/dev/null || true
 
 # Start backend on port 8000
-(cd "$BACKEND_DIR" && "$UVICORN_BIN" main:app --reload --host 0.0.0.0 --port 8000) &
+(cd "$BACKEND_DIR" && "$UVICORN_BIN" main:socket_app --reload --host 0.0.0.0 --port 8000) &
 BACKEND_PID=$!
 
 # Start Next.js on port 3001

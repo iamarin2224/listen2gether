@@ -216,8 +216,8 @@ app.add_middleware(
     expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
 )
 
-# Mount Socket.IO ASGI app
-app.mount("/socket.io", socketio.ASGIApp(sio))
+# Mount Socket.IO ASGI app directly wrapping FastAPI or via mount
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="socket.io")
 
 
 # ---------------------------------------------------------------------------

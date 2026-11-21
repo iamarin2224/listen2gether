@@ -45,14 +45,15 @@ export default function RoomPage() {
 
   // Determine backend URL dynamically:
   const [backendUrl, setBackendUrl] = useState<string>(() => {
-    const envUrl = (process.env.NEXT_PUBLIC_BACKEND_URL ?? '').replace(/\/$/, '');
-    return envUrl;
+    return (process.env.NEXT_PUBLIC_BACKEND_URL ?? '').replace(/\/$/, '');
   });
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
       const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-      if (!isLocalHost || !backendUrl || backendUrl.includes('localhost') || backendUrl.includes('127.0.0.1')) {
+      // Only fallback to window.location.origin if running on localhost with gateway/ngrok tunnel
+      // Never override a configured production NEXT_PUBLIC_BACKEND_URL on Vercel!
+      if (isLocalHost && (!backendUrl || backendUrl.includes('localhost') || backendUrl.includes('127.0.0.1'))) {
         setBackendUrl(window.location.origin);
       }
     }
