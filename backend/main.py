@@ -193,9 +193,11 @@ async def lifespan(app: FastAPI):
 # Socket.IO server
 # ---------------------------------------------------------------------------
 
+# Leave cors_allowed_origins empty / [] on AsyncServer so CORSMiddleware on FastAPI
+# is the single source of truth for CORS headers, avoiding duplicate headers!
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins="*" if ALLOW_ALL_ORIGINS else ALLOWED_ORIGINS,
+    cors_allowed_origins=[],
     logger=False,
     engineio_logger=False,
 )
