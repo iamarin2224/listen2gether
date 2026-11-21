@@ -39,7 +39,10 @@ ALLOWED_ORIGINS: list[str] = [
     if origin.strip()
 ]
 
-log.info("CORS allowed origins: %s", ALLOWED_ORIGINS)
+# When wildcard or development tunneling is needed, or if "*" is specified:
+ALLOW_ALL_ORIGINS = "*" in ALLOWED_ORIGINS or os.getenv("ALLOW_ALL_CORS", "true").lower() in ("true", "1")
+
+log.info("CORS allowed origins: %s (allow_all=%s)", ALLOWED_ORIGINS, ALLOW_ALL_ORIGINS)
 
 # Optional cookies for yt-dlp (base64-encoded Netscape cookie file)
 YTDLP_COOKIES_B64: str = os.getenv("YTDLP_COOKIES_B64", "")
@@ -90,6 +93,7 @@ def _new_room(room_id: str) -> dict[str, Any]:
         "roomId": room_id,
         "currentTrack": None,
         "queue": [],
+        "history": [],
         "isPlaying": False,
         "anchorTime": 0.0,
         "anchorTimestamp": int(time.time() * 1000),
@@ -105,7 +109,10 @@ def _touch(room_id: str) -> None:
 def _public_state(room_id: str) -> dict[str, Any]:
     """Return the room state augmented with current listener count."""
     state = dict(room_state[room_id])
-    state["listeners"] = len(room_listeners.get(room_id, set()))
+    listeners_set = room_listeners.get(room_id, set())
+    # Send both listener count and listeners array for compatibility
+    state["listenerCount"] = len(listeners_set)
+    state["listeners"] = list(listeners_set)
     return state
 
 
@@ -118,6 +125,14 @@ async def advance_track(room_id: str) -> None:
     state = room_state.get(room_id)
     if state is None:
         return
+
+    # Push old track to history
+    if state.get("currentTrack"):
+        if "history" not in state:
+            state["history"] = []
+        state["history"].append(state["currentTrack"])
+        if len(state["history"]) > 50:
+            state["history"].pop(0)
 
     if state["queue"]:
         next_track = state["queue"].pop(0)
@@ -177,7 +192,7 @@ async def lifespan(app: FastAPI):
 
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins=ALLOWED_ORIGINS,
+    cors_allowed_origins="*" if ALLOW_ALL_ORIGINS else ALLOWED_ORIGINS,
     logger=False,
     engineio_logger=False,
 )
@@ -191,7 +206,7 @@ app = FastAPI(title="SyncWave API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"] if ALLOW_ALL_ORIGINS else ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -209,6 +224,24 @@ app.mount("/socket.io", socketio.ASGIApp(sio))
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@app.get("/api/rooms/{room_id}")
+async def check_room(room_id: str) -> JSONResponse:
+    rid = room_id.strip().upper()
+    exists = rid in room_state
+    return JSONResponse({"exists": exists, "roomId": rid})
+
+
+@app.post("/api/rooms")
+async def create_room_api(data: dict) -> JSONResponse:
+    room_id = data.get("roomId", "").strip().upper()
+    if not room_id:
+        room_id = os.urandom(3).hex().upper()
+    if room_id not in room_state:
+        room_state[room_id] = _new_room(room_id)
+        log.info("Room created via API: %s", room_id)
+    return JSONResponse({"roomId": room_id, "created": True})
 
 
 @app.get("/api/search")
@@ -283,7 +316,12 @@ async def stream_audio(video_id: str, request: Request) -> StreamingResponse:
             "no_warnings": True,
             "noplaylist": True,
             "skip_download": True,
-            "format": "bestaudio[ext=m4a]/bestaudio",
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "mweb"]
+                }
+            },
         }
         if COOKIES_PATH:
             ydl_opts["cookiefile"] = COOKIES_PATH
@@ -319,7 +357,7 @@ async def stream_audio(video_id: str, request: Request) -> StreamingResponse:
     req_headers: dict[str, str] = {
         "User-Agent": (
             upstream_headers.get("User-Agent")
-            or "Mozilla/5.0 (compatible; SyncWave/1.0)"
+            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
         ),
     }
     if incoming_range:
@@ -330,57 +368,39 @@ async def stream_audio(video_id: str, request: Request) -> StreamingResponse:
         if key in upstream_headers:
             req_headers[key] = upstream_headers[key]
 
-    async def _generate():
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            async with client.stream("GET", upstream_url, headers=req_headers) as resp:
-                async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
-                    yield chunk
-
-    # We need to probe upstream first (HEAD or partial GET) to get Content-Range
-    # We do a tiny GET to read the response headers, then stream the body.
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as probe_client:
-            probe_headers = dict(req_headers)
-            probe_req = probe_client.build_request("GET", upstream_url, headers=probe_headers)
-            probe_resp = await probe_client.send(probe_req, stream=True)
+        upstream_req = client.build_request("GET", upstream_url, headers=req_headers)
+        upstream_resp = await client.send(upstream_req, stream=True)
 
-            status_code = 206 if incoming_range else 200
-            response_headers: dict[str, str] = {
-                "Accept-Ranges": "bytes",
-                "Content-Type": "audio/mp4",
-            }
+        status_code = upstream_resp.status_code
+        response_headers: dict[str, str] = {
+            "Accept-Ranges": "bytes",
+            "Content-Type": upstream_resp.headers.get("Content-Type", "audio/mp4"),
+        }
 
-            upstream_content_range = probe_resp.headers.get("Content-Range")
-            upstream_content_length = probe_resp.headers.get("Content-Length")
-            upstream_content_type = probe_resp.headers.get("Content-Type", "audio/mp4")
+        if "Content-Range" in upstream_resp.headers:
+            response_headers["Content-Range"] = upstream_resp.headers["Content-Range"]
+        if "Content-Length" in upstream_resp.headers:
+            response_headers["Content-Length"] = upstream_resp.headers["Content-Length"]
 
-            if upstream_content_range:
-                response_headers["Content-Range"] = upstream_content_range
-            if upstream_content_length:
-                response_headers["Content-Length"] = upstream_content_length
-            if "audio" in upstream_content_type or "octet" in upstream_content_type:
-                response_headers["Content-Type"] = upstream_content_type
-
-            # Determine actual status from upstream
-            if probe_resp.status_code == 206:
-                status_code = 206
-            elif probe_resp.status_code == 200 and not incoming_range:
-                status_code = 200
-
-            async def _stream_body():
-                async for chunk in probe_resp.aiter_bytes(chunk_size=CHUNK_SIZE):
+        async def _stream_body():
+            try:
+                async for chunk in upstream_resp.aiter_bytes(chunk_size=CHUNK_SIZE):
                     yield chunk
-                await probe_resp.aclose()
+            finally:
+                await upstream_resp.aclose()
+                await client.aclose()
 
-            return StreamingResponse(
-                _stream_body(),
-                status_code=status_code,
-                headers=response_headers,
-            )
+        return StreamingResponse(
+            _stream_body(),
+            status_code=status_code,
+            headers=response_headers,
+        )
 
-    except httpx.RequestError as exc:
+    except Exception as exc:
+        await client.aclose()
         log.exception("Upstream request error for video_id=%s: %s", video_id, exc)
-        # Invalidate cache on network error
         stream_url_cache.pop(video_id, None)
         raise HTTPException(status_code=502, detail=f"Upstream error: {exc}")
 
@@ -412,19 +432,25 @@ async def disconnect(sid: str) -> None:
 @sio.on("join_room")
 async def on_join_room(sid: str, data: dict) -> None:
     """
-    data: { roomId: str, displayName: str }
+    data: { roomId: str, displayName: str, create?: bool }
     """
     room_id: str = data.get("roomId", "").strip().upper()
     display_name: str = data.get("displayName", "Guest").strip() or "Guest"
+    is_create: bool = bool(data.get("create", False))
 
     if not room_id:
         await sio.emit("error", {"message": "roomId is required"}, to=sid)
         return
 
-    # Create room if it doesn't exist
+    # Check if room exists
     if room_id not in room_state:
-        room_state[room_id] = _new_room(room_id)
-        log.info("Room created: %s", room_id)
+        if is_create:
+            room_state[room_id] = _new_room(room_id)
+            log.info("Room created: %s", room_id)
+        else:
+            log.warning("Non-existent room access: %s", room_id)
+            await sio.emit("room_not_found", {"roomId": room_id}, to=sid)
+            return
 
     await sio.enter_room(sid, room_id)
     room_listeners.setdefault(room_id, set()).add(sid)
@@ -463,18 +489,34 @@ async def on_leave_room(sid: str, data: dict) -> None:
 @sio.on("play_pause")
 async def on_play_pause(sid: str, data: dict) -> None:
     """
-    data: { roomId: str, isPlaying: bool, anchorTime: float, anchorTimestamp: int }
+    data: { roomId: str, action?: str, isPlaying?: bool, anchorTime?: float, anchorTimestamp?: int }
     """
     room_id: str = data.get("roomId", "").strip().upper()
     state = room_state.get(room_id)
     if state is None:
         return
 
-    state["isPlaying"] = bool(data.get("isPlaying", False))
-    state["anchorTime"] = float(data.get("anchorTime", state["anchorTime"]))
-    state["anchorTimestamp"] = int(data.get("anchorTimestamp", int(time.time() * 1000)))
-    _touch(room_id)
+    if "action" in data:
+        action = data.get("action")
+        if action == "play":
+            state["isPlaying"] = True
+            state["anchorTimestamp"] = int(time.time() * 1000)
+        elif action == "pause":
+            # calculate elapsed
+            if state["isPlaying"]:
+                elapsed = (time.time() * 1000 - state["anchorTimestamp"]) / 1000.0
+                state["anchorTime"] += elapsed
+            state["isPlaying"] = False
+            state["anchorTimestamp"] = int(time.time() * 1000)
+        else:
+            state["isPlaying"] = not state["isPlaying"]
+            state["anchorTimestamp"] = int(time.time() * 1000)
+    else:
+        state["isPlaying"] = bool(data.get("isPlaying", False))
+        state["anchorTime"] = float(data.get("anchorTime", state["anchorTime"]))
+        state["anchorTimestamp"] = int(data.get("anchorTimestamp", int(time.time() * 1000)))
 
+    _touch(room_id)
     log.info(
         "room=%s play_pause isPlaying=%s anchorTime=%.2f",
         room_id, state["isPlaying"], state["anchorTime"],
@@ -485,20 +527,56 @@ async def on_play_pause(sid: str, data: dict) -> None:
 @sio.on("seek")
 async def on_seek(sid: str, data: dict) -> None:
     """
-    data: { roomId: str, anchorTime: float, anchorTimestamp: int, isPlaying: bool }
+    data: { roomId: str, time?: float, anchorTime?: float, anchorTimestamp?: int, isPlaying?: bool }
     """
     room_id: str = data.get("roomId", "").strip().upper()
     state = room_state.get(room_id)
     if state is None:
         return
 
-    state["anchorTime"] = float(data.get("anchorTime", state["anchorTime"]))
-    state["anchorTimestamp"] = int(data.get("anchorTimestamp", int(time.time() * 1000)))
+    target_time = data.get("time")
+    if target_time is None:
+        target_time = data.get("anchorTime", state["anchorTime"])
+
+    state["anchorTime"] = max(0.0, float(target_time))
+    state["anchorTimestamp"] = int(time.time() * 1000)
     if "isPlaying" in data:
         state["isPlaying"] = bool(data["isPlaying"])
     _touch(room_id)
 
     log.info("room=%s seek anchorTime=%.2f", room_id, state["anchorTime"])
+    await sio.emit("room_state", _public_state(room_id), room=room_id)
+
+
+@sio.on("play_now")
+async def on_play_now(sid: str, data: dict) -> None:
+    """
+    data: { roomId: str, track: { videoId, title, artist, duration, thumbnail } }
+    """
+    room_id: str = data.get("roomId", "").strip().upper()
+    state = room_state.get(room_id)
+    if state is None:
+        return
+
+    track: dict[str, Any] | None = data.get("track")
+    if not track or not track.get("videoId"):
+        await sio.emit("error", {"message": "Invalid track"}, to=sid)
+        return
+
+    # Push old track to history
+    if state.get("currentTrack"):
+        if "history" not in state:
+            state["history"] = []
+        state["history"].append(state["currentTrack"])
+        if len(state["history"]) > 50:
+            state["history"].pop(0)
+
+    state["currentTrack"] = track
+    state["isPlaying"] = True
+    state["anchorTime"] = 0.0
+    state["anchorTimestamp"] = int(time.time() * 1000)
+    _touch(room_id)
+    log.info("room=%s play_now track %s", room_id, track.get("videoId"))
     await sio.emit("room_state", _public_state(room_id), room=room_id)
 
 
@@ -548,6 +626,76 @@ async def on_skip_track(sid: str, data: dict) -> None:
     await advance_track(room_id)
 
 
+@sio.on("previous_track")
+async def on_previous_track(sid: str, data: dict) -> None:
+    """
+    data: { roomId: str }
+    If track played > 4s, restart it. Otherwise, pop previous track from history.
+    """
+    room_id: str = data.get("roomId", "").strip().upper()
+    state = room_state.get(room_id)
+    if not state:
+        return
+
+    elapsed = 0.0
+    if state["isPlaying"]:
+        elapsed = (time.time() * 1000 - state["anchorTimestamp"]) / 1000.0
+    current_pos = state["anchorTime"] + elapsed
+
+    if current_pos > 4.0:
+        state["anchorTime"] = 0.0
+        state["anchorTimestamp"] = int(time.time() * 1000)
+    elif state.get("history"):
+        prev_track = state["history"].pop()
+        if state["currentTrack"]:
+            state["queue"].insert(0, state["currentTrack"])
+        state["currentTrack"] = prev_track
+        state["isPlaying"] = True
+        state["anchorTime"] = 0.0
+        state["anchorTimestamp"] = int(time.time() * 1000)
+    else:
+        state["anchorTime"] = 0.0
+        state["anchorTimestamp"] = int(time.time() * 1000)
+
+    _touch(room_id)
+    log.info("room=%s previous_track", room_id)
+    await sio.emit("room_state", _public_state(room_id), room=room_id)
+
+
+@sio.on("remove_from_queue")
+async def on_remove_from_queue(sid: str, data: dict) -> None:
+    """
+    data: { roomId: str, index: int }
+    """
+    room_id: str = data.get("roomId", "").strip().upper()
+    index = data.get("index")
+    state = room_state.get(room_id)
+    if state and isinstance(index, int) and 0 <= index < len(state["queue"]):
+        removed = state["queue"].pop(index)
+        _touch(room_id)
+        log.info("room=%s removed track %s from queue at index %d", room_id, removed.get("videoId"), index)
+        await sio.emit("room_state", _public_state(room_id), room=room_id)
+
+
+@sio.on("move_queue_item")
+async def on_move_queue_item(sid: str, data: dict) -> None:
+    """
+    data: { roomId: str, fromIndex: int, toIndex: int }
+    """
+    room_id: str = data.get("roomId", "").strip().upper()
+    from_idx = data.get("fromIndex")
+    to_idx = data.get("toIndex")
+    state = room_state.get(room_id)
+    if state and isinstance(from_idx, int) and isinstance(to_idx, int):
+        queue = state["queue"]
+        if 0 <= from_idx < len(queue) and 0 <= to_idx < len(queue):
+            item = queue.pop(from_idx)
+            queue.insert(to_idx, item)
+            _touch(room_id)
+            log.info("room=%s reordered queue: %d -> %d", room_id, from_idx, to_idx)
+            await sio.emit("room_state", _public_state(room_id), room=room_id)
+
+
 @sio.on("track_ended")
 async def on_track_ended(sid: str, data: dict) -> None:
     """
@@ -563,11 +711,9 @@ async def on_track_ended(sid: str, data: dict) -> None:
     current = state.get("currentTrack")
 
     if current is None:
-        # Already no track — nothing to do
         return
 
-    if current.get("videoId") != reported_id:
-        # A different track is playing now (race condition / duplicate event) — ignore
+    if reported_id and current.get("videoId") != reported_id:
         log.info(
             "room=%s track_ended ignored: reported=%s current=%s",
             room_id, reported_id, current.get("videoId"),

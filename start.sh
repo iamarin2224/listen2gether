@@ -27,30 +27,36 @@ elif [ -f "$BACKEND_DIR/.venv/bin/uvicorn" ]; then
 fi
 
 echo "=========================================================="
-echo " Starting SyncWave (Backend + Frontend)"
-echo " Backend:  http://localhost:8000"
-echo " Frontend: http://localhost:3000"
-echo " Press Ctrl+C to stop both processes cleanly"
+echo " Starting SyncWave (Backend + Frontend + Unified Gateway)"
+echo "   Gateway (Main URL / Tunnel): http://localhost:3000"
+echo "   Next.js Internal:            http://localhost:3001"
+echo "   FastAPI Backend Internal:    http://localhost:8000"
+echo "   Single ngrok command:        ngrok http 3000"
+echo " Press Ctrl+C to stop all processes cleanly"
 echo "=========================================================="
 
 cleanup() {
     echo ""
     echo "Stopping SyncWave servers..."
-    kill "$BACKEND_PID" "$FRONTEND_PID" 2>/dev/null
-    wait "$BACKEND_PID" "$FRONTEND_PID" 2>/dev/null
+    kill "$GATEWAY_PID" "$BACKEND_PID" "$FRONTEND_PID" 2>/dev/null
+    wait "$GATEWAY_PID" "$BACKEND_PID" "$FRONTEND_PID" 2>/dev/null
     echo "All processes stopped."
     exit 0
 }
 
 trap cleanup SIGINT SIGTERM EXIT
 
-# Start backend
+# Start backend on port 8000
 (cd "$BACKEND_DIR" && "$UVICORN_BIN" main:app --reload --host 0.0.0.0 --port 8000) &
 BACKEND_PID=$!
 
-# Start frontend
-(cd "$FRONTEND_DIR" && npm run dev) &
+# Start Next.js on port 3001
+(cd "$FRONTEND_DIR" && npx next dev -p 3001) &
 FRONTEND_PID=$!
 
-# Wait for both processes
+# Start Unified Gateway on port 3000 (routes frontend + backend + WebSockets)
+node "$ROOT_DIR/gateway.js" &
+GATEWAY_PID=$!
+
+# Wait for all processes
 wait

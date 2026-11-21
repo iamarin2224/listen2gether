@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 python-socketio
 httpx
-yt-dlp
+yt-dlp[default]
+yt-dlp-ejs
 python-dotenv
 aiofiles

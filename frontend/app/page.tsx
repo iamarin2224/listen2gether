@@ -43,7 +43,10 @@ export default function HomePage() {
   const [nameError, setNameError] = useState('');
   const [joinError, setJoinError] = useState('');
 
-  function handleCreateRoom() {
+  const parsedCode = parseRoomCode(joinCode);
+  const isValidPattern = /^[A-Za-z0-9]{6}$/.test(parsedCode);
+
+  async function handleCreateRoom() {
     const name = displayName.trim();
     if (!name) {
       setNameError('Please enter your display name first.');
@@ -52,6 +55,14 @@ export default function HomePage() {
     setNameError('');
     const slug = generateRoomCode();
     sessionStorage.setItem('syncwave_displayName', name);
+    sessionStorage.setItem(`syncwave_created_${slug}`, 'true');
+    try {
+      await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: slug }),
+      });
+    } catch {}
     router.push(`/room/${slug}`);
   }
 
@@ -156,8 +167,13 @@ export default function HomePage() {
           )}
           <button
             onClick={handleJoinRoom}
-            className="w-full bg-gray-700 hover:bg-gray-600 active:bg-gray-800 text-white font-semibold py-3 rounded-xl transition-colors text-sm"
+            className={`w-full font-semibold py-3 rounded-xl transition-all text-sm flex items-center justify-center gap-2 ${
+              isValidPattern
+                ? 'bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white shadow-lg shadow-emerald-900/40 cursor-pointer'
+                : 'bg-gray-700 hover:bg-gray-600 active:bg-gray-800 text-gray-300'
+            }`}
           >
+            {isValidPattern && <span>✓</span>}
             Join Room
           </button>
         </div>

@@ -1,42 +1,34 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Image from 'next/image';
+import { Socket } from 'socket.io-client';
 import { getSocket } from '@/lib/socket';
-import type { Track, RoomState } from './types';
-import type { Socket } from 'socket.io-client';
+import { RoomState, Track } from './types';
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ── Helpers ──
 
-type ConnStatus = 'connecting' | 'synced' | 'reconnecting';
-
-// Augment Navigator for non-standard iOS APIs
-declare global {
-  interface Navigator {
-    audioSession?: { type: string };
-  }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function formatTime(secs: number): string {
-  if (!isFinite(secs) || secs < 0) return '0:00';
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
+function formatTime(seconds?: number): string {
+  if (seconds == null || isNaN(seconds)) return '0:00';
+  const s = Math.max(0, Math.floor(seconds));
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}:${rem.toString().padStart(2, '0')}`;
 }
 
 function MusicWaveIcon({ playing }: { playing: boolean }) {
   return (
-    <div className="flex items-end gap-[2px] h-5">
-      {[0.6, 1, 0.75, 1.1, 0.65].map((scale, i) => (
+    <div className="flex items-end gap-[3px] h-5">
+      {[0.5, 0.9, 0.7, 1.0, 0.6].map((scale, i) => (
         <span
           key={i}
-          className={`block w-1 rounded-full ${playing ? 'bg-sky-400 animate-wave' : 'bg-gray-500'}`}
+          className={`block w-1 rounded-full bg-sky-400 transition-all duration-300 ${
+            playing ? 'animate-wave' : 'opacity-40'
+          }`}
           style={{
-            height: `${scale * 18}px`,
-            animationDelay: playing ? `${i * 0.14}s` : '0s',
+            height: playing ? `${scale * 16}px` : '4px',
+            animationDelay: `${i * 0.15}s`,
           }}
         />
       ))}
@@ -44,19 +36,31 @@ function MusicWaveIcon({ playing }: { playing: boolean }) {
   );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+type ConnStatus = 'connecting' | 'synced' | 'reconnecting' | 'disconnected';
 
 export default function RoomPage() {
   const params = useParams();
   const router = useRouter();
-  const roomId = (params?.roomId as string) ?? '';
+  const roomId = ((params?.roomId as string) ?? '').toUpperCase();
 
-  const backendUrl = (
-    process.env.NEXT_PUBLIC_BACKEND_URL ?? ''
-  ).replace(/\/$/, '');
+  // Determine backend URL dynamically:
+  const [backendUrl, setBackendUrl] = useState<string>(() => {
+    const envUrl = (process.env.NEXT_PUBLIC_BACKEND_URL ?? '').replace(/\/$/, '');
+    return envUrl;
+  });
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      if (!isLocalHost || !backendUrl || backendUrl.includes('localhost') || backendUrl.includes('127.0.0.1')) {
+        setBackendUrl(window.location.origin);
+      }
+    }
+  }, [backendUrl]);
 
   // ── State ──
   const [roomState, setRoomState] = useState<RoomState | null>(null);
+  const [roomNotFound, setRoomNotFound] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Track[]>([]);
   const [connStatus, setConnStatus] = useState<ConnStatus>('connecting');
@@ -67,6 +71,13 @@ export default function RoomPage() {
   const [isSearching, setIsSearching] = useState(false);
   const [copied, setCopied] = useState(false);
   const [displayName, setDisplayName] = useState('Listener');
+  const [canShare, setCanShare] = useState(false);
+
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && 'share' in navigator) {
+      setCanShare(true);
+    }
+  }, []);
 
   // ── Refs ──
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -95,15 +106,34 @@ export default function RoomPage() {
       const src = `${backendUrl}/api/stream/${track.videoId}`;
       if (audio.src !== src) {
         audio.src = src;
-        audio.load();
       }
       if (startAt > 0.5) {
-        audio.currentTime = startAt;
+        const setInitialTime = () => {
+          try {
+            audio.currentTime = startAt;
+          } catch {}
+          audio.removeEventListener('loadedmetadata', setInitialTime);
+        };
+        if (audio.readyState >= 1) {
+          try {
+            audio.currentTime = startAt;
+          } catch {}
+        } else {
+          audio.addEventListener('loadedmetadata', setInitialTime);
+        }
       }
       if (autoplay) {
-        audio.play().catch(() => {
-          // Autoplay blocked — user must tap "Join Audio Session"
-        });
+        const p = audio.play();
+        if (p !== undefined) {
+          p.then(() => {
+            setAudioUnlocked(true);
+            audioUnlockedRef.current = true;
+          }).catch((err) => {
+            console.warn('[Audio] Autoplay pending user tap:', err);
+            setAudioUnlocked(false);
+            audioUnlockedRef.current = false;
+          });
+        }
       }
     },
     [backendUrl]
@@ -130,17 +160,20 @@ export default function RoomPage() {
 
       const targetTime = computeTargetTime(state);
 
-      // Correct drift > 1.5 s (but not while user is dragging)
+      // Correct drift > 1.2 s (but not while user is dragging slider)
       if (!isSeekingRef.current) {
         const drift = Math.abs(audio.currentTime - targetTime);
-        if (drift > 1.5) {
+        if (drift > 1.2) {
           audio.currentTime = targetTime;
         }
       }
 
       if (state.isPlaying) {
         if (audio.paused) {
-          audio.play().catch(() => {});
+          const p = audio.play();
+          if (p !== undefined) {
+            p.catch(() => {});
+          }
         }
       } else {
         if (!audio.paused) {
@@ -175,20 +208,29 @@ export default function RoomPage() {
     navigator.mediaSession.setActionHandler('pause', () => {
       socketRef.current?.emit('play_pause', { roomId, action: 'pause' });
     });
+    navigator.mediaSession.setActionHandler('previoustrack', () => {
+      socketRef.current?.emit('previous_track', { roomId });
+    });
     navigator.mediaSession.setActionHandler('nexttrack', () => {
       socketRef.current?.emit('skip_track', { roomId });
     });
     navigator.mediaSession.setActionHandler('seekto', (details) => {
       if (details.seekTime != null) {
-        socketRef.current?.emit('seek', { roomId, time: details.seekTime });
+        socketRef.current?.emit('seek', {
+          roomId,
+          time: details.seekTime,
+          anchorTime: details.seekTime,
+        });
       }
     });
   }, [roomId]);
 
   // ── Setup audioSession for iOS background audio ──
   const setupAudioSession = useCallback(() => {
-    if (navigator.audioSession) {
-      navigator.audioSession.type = 'playback';
+    if (typeof navigator !== 'undefined' && (navigator as any).audioSession) {
+      try {
+        (navigator as any).audioSession.type = 'playback';
+      } catch {}
     }
   }, []);
 
@@ -198,19 +240,18 @@ export default function RoomPage() {
       sessionStorage.getItem('syncwave_displayName') ?? 'Listener';
     setDisplayName(storedName);
 
-    // Setup audioSession immediately
     setupAudioSession();
-
-    // Wire mediaSession handlers (they can be set even before metadata)
     wireMediaSessionHandlers();
 
     const socket = getSocket(backendUrl);
     socketRef.current = socket;
 
-    // ── Socket event handlers ──
+    const isCreated = typeof window !== 'undefined' && sessionStorage.getItem(`syncwave_created_${roomId}`) === 'true';
+
     socket.on('connect', () => {
       setConnStatus('synced');
-      socket.emit('join_room', { roomId, displayName: storedName });
+      setRoomNotFound(false);
+      socket.emit('join_room', { roomId, displayName: storedName, create: isCreated });
     });
 
     socket.on('disconnect', () => {
@@ -221,7 +262,13 @@ export default function RoomPage() {
       setConnStatus('reconnecting');
     });
 
+    socket.on('room_not_found', () => {
+      setRoomNotFound(true);
+      setConnStatus('disconnected');
+    });
+
     socket.on('room_state', (state: RoomState) => {
+      setRoomNotFound(false);
       setRoomState(state);
     });
 
@@ -229,13 +276,14 @@ export default function RoomPage() {
       socket.connect();
     } else {
       setConnStatus('synced');
-      socket.emit('join_room', { roomId, displayName: storedName });
+      socket.emit('join_room', { roomId, displayName: storedName, create: isCreated });
     }
 
     return () => {
       socket.off('connect');
       socket.off('disconnect');
       socket.off('connect_error');
+      socket.off('room_not_found');
       socket.off('room_state');
       socket.emit('leave_room', { roomId });
     };
@@ -270,15 +318,21 @@ export default function RoomPage() {
       const state = roomStateRef.current;
       if (!state) return;
 
-      socketRef.current?.emit('track_ended', { roomId });
+      const currentVid = state.currentTrack?.videoId;
+      socketRef.current?.emit('track_ended', {
+        roomId,
+        videoId: currentVid,
+      });
 
-      // Optimistically load next if queue is known
-      if (state.queue.length > 0) {
+      // Chain continuous playback immediately inside the onEnded callback (iOS-safe)
+      if (state.queue && state.queue.length > 0) {
         const next = state.queue[0];
-        const src = `${backendUrl}/api/stream/${next.videoId}`;
-        audio!.src = src;
-        audio!.load();
-        audio!.play().catch(() => {});
+        const nextSrc = `${backendUrl}/api/stream/${next.videoId}`;
+        audio!.src = nextSrc;
+        const p = audio!.play();
+        if (p !== undefined) {
+          p.catch(() => {});
+        }
       }
     }
 
@@ -313,26 +367,68 @@ export default function RoomPage() {
     }
   }
 
+  function handleClearSearch() {
+    setSearchQuery('');
+    setSearchResults([]);
+  }
+
   function handlePlayNow(track: Track) {
+    setupAudioSession();
+    setAudioUnlocked(true);
+    audioUnlockedRef.current = true;
+
+    const audio = audioRef.current;
+    if (audio) {
+      const p = audio.play();
+      if (p !== undefined) p.catch(() => {});
+    }
+
     socketRef.current?.emit('play_now', { roomId, track });
     setSearchResults([]);
     setSearchQuery('');
   }
 
   function handleAddToQueue(track: Track) {
+    setupAudioSession();
+    setAudioUnlocked(true);
+    audioUnlockedRef.current = true;
+
     socketRef.current?.emit('add_to_queue', { roomId, track });
   }
 
   function handlePlayPause() {
     if (!roomState) return;
+
+    setupAudioSession();
+    setAudioUnlocked(true);
+    audioUnlockedRef.current = true;
+
+    const audio = audioRef.current;
+    if (audio && !roomState.isPlaying) {
+      const p = audio.play();
+      if (p !== undefined) p.catch(() => {});
+    }
+
     socketRef.current?.emit('play_pause', {
       roomId,
       action: roomState.isPlaying ? 'pause' : 'play',
     });
   }
 
+  function handlePrevious() {
+    socketRef.current?.emit('previous_track', { roomId });
+  }
+
   function handleSkip() {
     socketRef.current?.emit('skip_track', { roomId });
+  }
+
+  function handleRemoveFromQueue(index: number) {
+    socketRef.current?.emit('remove_from_queue', { roomId, index });
+  }
+
+  function handleMoveQueueItem(fromIndex: number, toIndex: number) {
+    socketRef.current?.emit('move_queue_item', { roomId, fromIndex, toIndex });
   }
 
   function handleSeekChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -340,14 +436,24 @@ export default function RoomPage() {
     setIsSeeking(true);
     setCurrentTime(val);
     if (audioRef.current) {
-      audioRef.current.currentTime = val;
+      try {
+        audioRef.current.currentTime = val;
+      } catch {}
     }
   }
 
-  function handleSeekCommit(e: React.ChangeEvent<HTMLInputElement>) {
-    const val = parseFloat(e.target.value);
+  function handleSeekCommit(
+    e: React.MouseEvent<HTMLInputElement> | React.TouchEvent<HTMLInputElement>
+  ) {
+    const val = parseFloat((e.currentTarget as HTMLInputElement).value);
     setIsSeeking(false);
-    socketRef.current?.emit('seek', { roomId, time: val });
+    setCurrentTime(val);
+    if (audioRef.current) {
+      try {
+        audioRef.current.currentTime = val;
+      } catch {}
+    }
+    socketRef.current?.emit('seek', { roomId, time: val, anchorTime: val });
   }
 
   async function handleCopyLink() {
@@ -355,9 +461,7 @@ export default function RoomPage() {
       await navigator.clipboard.writeText(window.location.href);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // fallback: ignore
-    }
+    } catch {}
   }
 
   async function handleShare() {
@@ -370,39 +474,78 @@ export default function RoomPage() {
     }
   }
 
-  // ── iOS audio unlock overlay handler ──
   async function handleUnlockAudio() {
     const audio = audioRef.current;
     if (!audio) return;
     setupAudioSession();
     try {
       await audio.play();
-    } catch {
-      // If still blocked, that's OK — we still mark unlocked so overlay hides
-    }
+    } catch {}
     setAudioUnlocked(true);
     audioUnlockedRef.current = true;
   }
 
+  function handleCreateSpecificRoom(code: string) {
+    sessionStorage.setItem(`syncwave_created_${code}`, 'true');
+    setRoomNotFound(false);
+    socketRef.current?.emit('join_room', { roomId: code, displayName, create: true });
+  }
+
   // ── Derived values ──
   const track = roomState?.currentTrack ?? null;
-  const listenerCount = roomState?.listeners?.length ?? 0;
+  const listenerCount =
+    typeof (roomState as any)?.listenerCount === 'number'
+      ? (roomState as any).listenerCount
+      : Array.isArray(roomState?.listeners)
+      ? roomState.listeners.length
+      : 1;
   const queue = roomState?.queue ?? [];
   const isPlaying = roomState?.isPlaying ?? false;
   const seekMax = duration > 0 ? duration : track?.duration ?? 100;
 
-  // ─── Render ───────────────────────────────────────────────────────────────
+  // ─── Room Not Found Screen ───
+  if (roomNotFound) {
+    return (
+      <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center px-4">
+        <div className="bg-gray-800 border border-gray-700 rounded-3xl p-8 max-w-md w-full text-center space-y-6 shadow-2xl">
+          <div className="w-16 h-16 bg-red-500/10 text-red-400 rounded-full flex items-center justify-center mx-auto text-3xl">
+            🔍
+          </div>
+          <div className="space-y-2">
+            <h1 className="text-2xl font-bold text-white">Room Not Found</h1>
+            <p className="text-gray-400 text-sm">
+              Room <span className="font-mono font-bold text-sky-400 px-2 py-0.5 bg-gray-900 rounded">{roomId}</span> does not exist or has expired due to inactivity.
+            </p>
+          </div>
+          <div className="space-y-3 pt-2">
+            <button
+              onClick={() => handleCreateSpecificRoom(roomId)}
+              className="w-full bg-sky-500 hover:bg-sky-400 active:bg-sky-600 text-white font-semibold py-3 rounded-xl transition text-sm shadow-lg shadow-sky-900/40 cursor-pointer"
+            >
+              Create Room &ldquo;{roomId}&rdquo;
+            </button>
+            <button
+              onClick={() => router.push('/')}
+              className="w-full bg-gray-700 hover:bg-gray-600 active:bg-gray-800 text-white font-semibold py-3 rounded-xl transition text-sm cursor-pointer"
+            >
+              Return to Home
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
+  // ─── Main Render ───
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col">
-
-      {/* Hidden native audio — NEVER an iframe */}
+      {/* Hidden native audio element */}
       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
       <audio
         ref={audioRef}
         playsInline
         crossOrigin="anonymous"
-        preload="metadata"
+        preload="auto"
         className="hidden"
       />
 
@@ -411,7 +554,7 @@ export default function RoomPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
           <button
             onClick={handleUnlockAudio}
-            className="flex flex-col items-center gap-4 bg-gray-800 border border-gray-700 rounded-3xl px-10 py-10 shadow-2xl active:scale-95 transition-transform"
+            className="flex flex-col items-center gap-4 bg-gray-800 border border-gray-700 rounded-3xl px-10 py-10 shadow-2xl active:scale-95 transition-transform cursor-pointer"
           >
             <span className="text-5xl">🎵</span>
             <span className="text-xl font-bold text-white">Tap to Join Audio Session</span>
@@ -429,7 +572,7 @@ export default function RoomPage() {
       <header className="flex items-center justify-between px-4 py-3 border-b border-gray-800 bg-gray-900/90 backdrop-blur sticky top-0 z-30">
         <button
           onClick={() => router.push('/')}
-          className="text-sky-400 font-extrabold text-lg tracking-tight"
+          className="text-sky-400 font-extrabold text-lg tracking-tight cursor-pointer"
         >
           Sync<span className="text-white">Wave</span>
         </button>
@@ -462,7 +605,7 @@ export default function RoomPage() {
 
         {/* Room code + listener count */}
         <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-500 font-mono bg-gray-800 px-2 py-1 rounded-lg">
+          <span className="text-xs text-gray-400 font-mono bg-gray-800 px-2 py-1 rounded-lg">
             {roomId}
           </span>
           <span className="text-xs text-gray-400 flex items-center gap-1">
@@ -475,7 +618,6 @@ export default function RoomPage() {
       </header>
 
       <main className="flex-1 flex flex-col max-w-xl mx-auto w-full px-4 pb-8 gap-6 pt-6">
-
         {/* ── Now Playing ── */}
         <section className="bg-gray-800 rounded-2xl p-5 border border-gray-700 space-y-4">
           <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-400">
@@ -516,11 +658,11 @@ export default function RoomPage() {
                   min={0}
                   max={seekMax}
                   step={0.5}
-                  value={isSeeking ? currentTime : currentTime}
+                  value={currentTime}
                   onChange={handleSeekChange}
                   onMouseUp={handleSeekCommit}
-                  onTouchEnd={handleSeekCommit as unknown as React.TouchEventHandler<HTMLInputElement>}
-                  className="w-full h-1 accent-sky-400"
+                  onTouchEnd={handleSeekCommit}
+                  className="w-full h-1 accent-sky-400 cursor-pointer"
                 />
                 <div className="flex justify-between text-xs text-gray-500">
                   <span>{formatTime(currentTime)}</span>
@@ -529,34 +671,45 @@ export default function RoomPage() {
               </div>
 
               {/* Controls */}
-              <div className="flex items-center justify-center gap-6">
+              <div className="flex items-center justify-center gap-5">
+                {/* Previous */}
+                <button
+                  onClick={handlePrevious}
+                  className="w-10 h-10 rounded-full bg-gray-700 hover:bg-gray-600 active:bg-gray-800 flex items-center justify-center transition-colors cursor-pointer"
+                  aria-label="Previous"
+                  title="Previous Track / Restart"
+                >
+                  <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" />
+                  </svg>
+                </button>
+
                 {/* Play / Pause */}
                 <button
                   onClick={handlePlayPause}
-                  className="w-14 h-14 rounded-full bg-sky-500 hover:bg-sky-400 active:bg-sky-600 flex items-center justify-center shadow-lg shadow-sky-900/50 transition-colors"
+                  className="w-14 h-14 rounded-full bg-sky-500 hover:bg-sky-400 active:bg-sky-600 flex items-center justify-center shadow-lg shadow-sky-900/50 transition-colors cursor-pointer"
                   aria-label={isPlaying ? 'Pause' : 'Play'}
                 >
                   {isPlaying ? (
-                    /* Pause icon */
                     <svg className="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24">
                       <rect x="6" y="4" width="4" height="16" rx="1" />
                       <rect x="14" y="4" width="4" height="16" rx="1" />
                     </svg>
                   ) : (
-                    /* Play icon */
                     <svg className="w-6 h-6 text-white ml-1" fill="currentColor" viewBox="0 0 24 24">
                       <path d="M8 5v14l11-7z" />
                     </svg>
                   )}
                 </button>
 
-                {/* Skip */}
+                {/* Skip / Next */}
                 <button
                   onClick={handleSkip}
-                  className="w-10 h-10 rounded-full bg-gray-700 hover:bg-gray-600 flex items-center justify-center transition-colors"
-                  aria-label="Skip"
+                  className="w-10 h-10 rounded-full bg-gray-700 hover:bg-gray-600 active:bg-gray-800 flex items-center justify-center transition-colors cursor-pointer"
+                  aria-label="Next Track"
+                  title="Next Track"
                 >
-                  <svg className="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
                   </svg>
                 </button>
@@ -577,7 +730,7 @@ export default function RoomPage() {
         <section className="flex gap-2">
           <button
             onClick={handleCopyLink}
-            className="flex-1 flex items-center justify-center gap-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 py-2.5 rounded-xl text-sm font-medium transition-colors"
+            className="flex-1 flex items-center justify-center gap-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer"
           >
             {copied ? (
               <><span>✓</span> Copied!</>
@@ -591,10 +744,10 @@ export default function RoomPage() {
               </>
             )}
           </button>
-          {typeof navigator !== 'undefined' && 'share' in navigator && (
+          {canShare && (
             <button
               onClick={handleShare}
-              className="flex-1 flex items-center justify-center gap-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 py-2.5 rounded-xl text-sm font-medium transition-colors"
+              className="flex-1 flex items-center justify-center gap-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
@@ -607,21 +760,43 @@ export default function RoomPage() {
 
         {/* ── Search ── */}
         <section className="space-y-3">
-          <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-400">
-            Search Music
-          </h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-400">
+              Search Music
+            </h2>
+            {(searchQuery || searchResults.length > 0) && (
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                className="text-xs text-sky-400 hover:text-sky-300 font-medium transition cursor-pointer"
+              >
+                Clear Search ✕
+              </button>
+            )}
+          </div>
           <form onSubmit={handleSearch} className="flex gap-2">
-            <input
-              type="text"
-              placeholder="Search YouTube…"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-sky-500 transition"
-            />
+            <div className="relative flex-1">
+              <input
+                type="text"
+                placeholder="Search YouTube songs, artists…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-2.5 pr-8 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-sky-500 transition"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={handleClearSearch}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white text-xs p-1"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
             <button
               type="submit"
               disabled={isSearching}
-              className="bg-sky-500 hover:bg-sky-400 disabled:opacity-50 px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors"
+              className="bg-sky-500 hover:bg-sky-400 active:bg-sky-600 disabled:opacity-50 px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors flex items-center justify-center cursor-pointer"
             >
               {isSearching ? (
                 <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
@@ -639,44 +814,46 @@ export default function RoomPage() {
 
           {/* Search results */}
           {searchResults.length > 0 && (
-            <ul className="space-y-2 max-h-80 overflow-y-auto scrollbar-thin pr-1">
-              {searchResults.map((result) => (
-                <li
-                  key={result.videoId}
-                  className="flex items-center gap-3 bg-gray-800 border border-gray-700 rounded-xl p-3"
-                >
-                  <div className="relative w-14 h-10 flex-shrink-0 rounded-lg overflow-hidden bg-gray-700">
-                    <Image
-                      src={result.thumbnail}
-                      alt={result.title}
-                      fill
-                      sizes="56px"
-                      className="object-cover"
-                      unoptimized
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-medium text-white line-clamp-1">{result.title}</p>
-                    <p className="text-xs text-gray-500 truncate">{result.artist}</p>
-                    <p className="text-xs text-gray-600">{formatTime(result.duration)}</p>
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    <button
-                      onClick={() => handlePlayNow(result)}
-                      className="text-xs bg-sky-500 hover:bg-sky-400 px-2.5 py-1 rounded-lg font-semibold transition-colors whitespace-nowrap"
-                    >
-                      ▶ Play
-                    </button>
-                    <button
-                      onClick={() => handleAddToQueue(result)}
-                      className="text-xs bg-gray-700 hover:bg-gray-600 px-2.5 py-1 rounded-lg font-semibold transition-colors whitespace-nowrap"
-                    >
-                      + Queue
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
+            <div className="space-y-2">
+              <ul className="space-y-2 max-h-80 overflow-y-auto scrollbar-thin pr-1">
+                {searchResults.map((result) => (
+                  <li
+                    key={result.videoId}
+                    className="flex items-center gap-3 bg-gray-800 border border-gray-700 rounded-xl p-3"
+                  >
+                    <div className="relative w-14 h-10 flex-shrink-0 rounded-lg overflow-hidden bg-gray-700">
+                      <Image
+                        src={result.thumbnail}
+                        alt={result.title}
+                        fill
+                        sizes="56px"
+                        className="object-cover"
+                        unoptimized
+                      />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-white line-clamp-1">{result.title}</p>
+                      <p className="text-xs text-gray-400 truncate">{result.artist}</p>
+                      <p className="text-xs text-gray-500">{formatTime(result.duration)}</p>
+                    </div>
+                    <div className="flex flex-col gap-1.5 flex-shrink-0">
+                      <button
+                        onClick={() => handlePlayNow(result)}
+                        className="text-xs bg-sky-500 hover:bg-sky-400 active:bg-sky-600 px-3 py-1 rounded-lg font-semibold transition-colors whitespace-nowrap cursor-pointer text-white"
+                      >
+                        ▶ Play
+                      </button>
+                      <button
+                        onClick={() => handleAddToQueue(result)}
+                        className="text-xs bg-gray-700 hover:bg-gray-600 active:bg-gray-800 px-3 py-1 rounded-lg font-semibold transition-colors whitespace-nowrap cursor-pointer text-gray-200"
+                      >
+                        + Queue
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
         </section>
 
@@ -686,13 +863,13 @@ export default function RoomPage() {
             <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-400">
               Up Next ({queue.length})
             </h2>
-            <ul className="space-y-2 max-h-64 overflow-y-auto scrollbar-thin pr-1">
+            <ul className="space-y-2 max-h-72 overflow-y-auto scrollbar-thin pr-1">
               {queue.map((item, idx) => (
                 <li
                   key={`${item.videoId}-${idx}`}
                   className="flex items-center gap-3 bg-gray-800 border border-gray-700 rounded-xl p-3"
                 >
-                  <span className="text-gray-600 text-xs w-4 text-center flex-shrink-0">
+                  <span className="text-gray-500 text-xs w-4 text-center flex-shrink-0 font-mono">
                     {idx + 1}
                   </span>
                   <div className="relative w-12 h-9 flex-shrink-0 rounded-lg overflow-hidden bg-gray-700">
@@ -707,16 +884,47 @@ export default function RoomPage() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="text-xs font-medium text-white line-clamp-1">{item.title}</p>
-                    <p className="text-xs text-gray-500 truncate">{item.artist}</p>
+                    <p className="text-xs text-gray-400 truncate">{item.artist}</p>
                   </div>
-                  {idx === 0 && (
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    {/* Reorder Up / Down buttons */}
+                    <div className="flex flex-col gap-0.5">
+                      <button
+                        onClick={() => handleMoveQueueItem(idx, idx - 1)}
+                        disabled={idx === 0}
+                        className="text-[10px] w-5 h-4 flex items-center justify-center bg-gray-700 hover:bg-gray-600 disabled:opacity-20 rounded text-gray-300 transition cursor-pointer"
+                        title="Move Up"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        onClick={() => handleMoveQueueItem(idx, idx + 1)}
+                        disabled={idx === queue.length - 1}
+                        className="text-[10px] w-5 h-4 flex items-center justify-center bg-gray-700 hover:bg-gray-600 disabled:opacity-20 rounded text-gray-300 transition cursor-pointer"
+                        title="Move Down"
+                      >
+                        ▼
+                      </button>
+                    </div>
+
+                    {/* Play Now */}
                     <button
-                      onClick={handleSkip}
-                      className="text-xs bg-gray-700 hover:bg-gray-600 px-2.5 py-1 rounded-lg font-semibold transition-colors"
+                      onClick={() => handlePlayNow(item)}
+                      className="text-xs bg-sky-500 hover:bg-sky-400 active:bg-sky-600 px-2 py-1.5 rounded-lg font-semibold transition text-white cursor-pointer"
+                      title="Play Now"
                     >
-                      Skip
+                      ▶
                     </button>
-                  )}
+
+                    {/* Remove from Queue (Available on ALL songs) */}
+                    <button
+                      onClick={() => handleRemoveFromQueue(idx)}
+                      className="text-xs bg-gray-700 hover:bg-red-500/20 hover:text-red-400 text-gray-400 px-2 py-1.5 rounded-lg font-semibold transition cursor-pointer"
+                      title="Remove from Queue"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -724,14 +932,14 @@ export default function RoomPage() {
         )}
 
         {/* ── Room Info Footer ── */}
-        <div className="flex items-center justify-between text-xs text-gray-600 border-t border-gray-800 pt-4">
+        <div className="flex items-center justify-between text-xs text-gray-500 border-t border-gray-800 pt-4">
           <span>
-            Room: <span className="font-mono text-gray-400">{roomId}</span>
+            Room: <span className="font-mono text-gray-300">{roomId}</span>
           </span>
           <span>
             {listenerCount} listener{listenerCount !== 1 ? 's' : ''}
           </span>
-          <span className="text-gray-700">SyncWave</span>
+          <span className="text-gray-600">SyncWave</span>
         </div>
       </main>
     </div>
