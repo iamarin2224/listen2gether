@@ -20,7 +20,7 @@ const BACKEND_PORT = 8000;
 const FRONTEND_PORT = 3001;
 
 function getTargetPort(url = '') {
-  if (url.startsWith('/api') || url.startsWith('/socket.io')) {
+  if (url.startsWith('/api') || url.startsWith('/socket.io') || url === '/health' || url.startsWith('/health/')) {
     return BACKEND_PORT;
   }
   return FRONTEND_PORT;

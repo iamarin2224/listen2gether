@@ -225,8 +225,14 @@ app.mount("/socket.io", socketio.ASGIApp(sio))
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
+@app.get("/api/health")
 async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({
+        "status": "ok",
+        "service": "listen2gether",
+        "activeRooms": len(room_state),
+        "timestamp": int(time.time()),
+    })
 
 
 @app.get("/api/rooms/{room_id}")
