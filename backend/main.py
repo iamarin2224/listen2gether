@@ -143,6 +143,9 @@ async def advance_track(room_id: str) -> None:
         state["isPlaying"] = True
         state["anchorTime"] = 0.0
         state["anchorTimestamp"] = int(time.time() * 1000)
+        # Pre-extract upcoming item in queue if available
+        if state["queue"] and state["queue"][0].get("videoId"):
+            asyncio.create_task(pre_extract_track(state["queue"][0]["videoId"]))
     else:
         state["currentTrack"] = None
         state["isPlaying"] = False
@@ -298,11 +301,101 @@ async def search(q: str = Query(..., min_length=1)) -> JSONResponse:
                 return results
 
         results = await loop.run_in_executor(None, _extract)
+        # Pre-extract stream URLs in background for top 2 search results to make playback instant
+        for item in results[:2]:
+            vid = item.get("videoId")
+            if vid:
+                asyncio.create_task(pre_extract_track(vid))
         return JSONResponse(results)
 
     except Exception as exc:
         log.exception("Search failed for query %r: %s", q, exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _extract_url_sync(video_id: str) -> tuple[str, dict[str, str]]:
+    """Synchronously extract playable stream URL using yt-dlp with multi-tier fallback."""
+    # Strategy 1: Fast audio extraction with mobile/tv/web clients
+    primary_opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "check_formats": False,
+        "format": "bestaudio/best",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "tv", "web"]
+            }
+        },
+    }
+    if COOKIES_PATH:
+        primary_opts["cookiefile"] = COOKIES_PATH
+
+    try:
+        with yt_dlp.YoutubeDL(primary_opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}", download=False
+            )
+            if info and info.get("url"):
+                return info["url"], info.get("http_headers", {})
+    except Exception as e:
+        log.warning("Primary yt-dlp extraction failed for %s (%s), trying fallback...", video_id, e)
+
+    # Strategy 2: Default yt-dlp extraction with general formats
+    fallback_opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "check_formats": False,
+        "format": "bestaudio/best",
+    }
+    if COOKIES_PATH:
+        fallback_opts["cookiefile"] = COOKIES_PATH
+
+    with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+        info = ydl.extract_info(
+            f"https://www.youtube.com/watch?v={video_id}", download=False
+        )
+        if not info or not info.get("url"):
+            raise ValueError(f"No playable stream URL found for {video_id}")
+        return info["url"], info.get("http_headers", {})
+
+
+async def get_or_extract_stream_url(video_id: str) -> tuple[str, dict[str, str]]:
+    """Return cached stream URL or extract a fresh one."""
+    cached = stream_url_cache.get(video_id)
+    now = time.time()
+    if cached and (now - cached["ts"]) < STREAM_CACHE_TTL:
+        log.debug("Cache hit for video_id=%s", video_id)
+        return cached["url"], cached.get("extra_headers", {})
+
+    log.info("Extracting stream URL for video_id=%s", video_id)
+    loop = asyncio.get_event_loop()
+    upstream_url, upstream_headers = await loop.run_in_executor(None, _extract_url_sync, video_id)
+
+    stream_url_cache[video_id] = {
+        "url": upstream_url,
+        "extra_headers": upstream_headers,
+        "ts": time.time(),
+    }
+    return upstream_url, upstream_headers
+
+
+async def pre_extract_track(video_id: str) -> None:
+    """Pre-resolve a video stream URL in the background before the user taps play."""
+    try:
+        if not video_id:
+            return
+        cached = stream_url_cache.get(video_id)
+        if cached and (time.time() - cached["ts"]) < STREAM_CACHE_TTL:
+            return
+        log.info("Background pre-extracting stream URL for %s", video_id)
+        await get_or_extract_stream_url(video_id)
+        log.info("Background pre-extraction completed for %s", video_id)
+    except Exception as e:
+        log.debug("Background pre-extraction failed for %s: %s", video_id, e)
 
 
 @app.get("/api/stream/{video_id}")
@@ -311,55 +404,11 @@ async def stream_audio(video_id: str, request: Request) -> StreamingResponse:
     Proxy yt-dlp extracted audio URL to the client with HTTP 206 range support.
     Caches the upstream URL for 30 minutes to avoid repeated yt-dlp calls.
     """
-    # --- Resolve upstream URL (with cache) ---
-    cached = stream_url_cache.get(video_id)
-    now = time.time()
-
-    if cached and (now - cached["ts"]) < STREAM_CACHE_TTL:
-        upstream_url: str = cached["url"]
-        upstream_headers: dict[str, str] = cached.get("extra_headers", {})
-        log.debug("Cache hit for video_id=%s", video_id)
-    else:
-        log.info("Extracting stream URL for video_id=%s", video_id)
-        ydl_opts: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "skip_download": True,
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "mweb"]
-                }
-            },
-        }
-        if COOKIES_PATH:
-            ydl_opts["cookiefile"] = COOKIES_PATH
-
-        try:
-            loop = asyncio.get_event_loop()
-
-            def _get_url() -> tuple[str, dict[str, str]]:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(
-                        f"https://www.youtube.com/watch?v={video_id}", download=False
-                    )
-                    if not info:
-                        raise ValueError("No info returned by yt-dlp")
-                    url: str = info["url"]
-                    extra: dict[str, str] = info.get("http_headers", {})
-                    return url, extra
-
-            upstream_url, upstream_headers = await loop.run_in_executor(None, _get_url)
-        except Exception as exc:
-            log.exception("yt-dlp extraction failed for video_id=%s: %s", video_id, exc)
-            raise HTTPException(status_code=502, detail=f"yt-dlp error: {exc}")
-
-        stream_url_cache[video_id] = {
-            "url": upstream_url,
-            "extra_headers": upstream_headers,
-            "ts": now,
-        }
+    try:
+        upstream_url, upstream_headers = await get_or_extract_stream_url(video_id)
+    except Exception as exc:
+        log.exception("yt-dlp extraction failed for video_id=%s: %s", video_id, exc)
+        raise HTTPException(status_code=502, detail=f"yt-dlp error: {exc}")
 
     # --- Forward range request to upstream ---
     incoming_range = request.headers.get("range")
@@ -384,9 +433,13 @@ async def stream_audio(video_id: str, request: Request) -> StreamingResponse:
         upstream_resp = await client.send(upstream_req, stream=True)
 
         status_code = upstream_resp.status_code
+        raw_content_type = upstream_resp.headers.get("Content-Type", "audio/mp4")
+        # Ensure browsers/iOS treat the stream as pure audio even if format 18 (mp4) container is returned
+        content_type = "audio/mp4" if raw_content_type.startswith("video/") else raw_content_type
+
         response_headers: dict[str, str] = {
             "Accept-Ranges": "bytes",
-            "Content-Type": upstream_resp.headers.get("Content-Type", "audio/mp4"),
+            "Content-Type": content_type,
         }
 
         if "Content-Range" in upstream_resp.headers:
@@ -472,6 +525,11 @@ async def on_join_room(sid: str, data: dict) -> None:
     await sio.emit("room_state", _public_state(room_id), to=sid)
     # Broadcast updated listener count to everyone in the room
     await sio.emit("room_state", _public_state(room_id), room=room_id)
+
+    # Pre-extract active track so joining clients start streaming immediately
+    curr_track = room_state.get(room_id, {}).get("currentTrack")
+    if curr_track and curr_track.get("videoId"):
+        asyncio.create_task(pre_extract_track(curr_track["videoId"]))
 
 
 @sio.on("leave_room")
@@ -597,6 +655,10 @@ async def on_play_now(sid: str, data: dict) -> None:
     log.info("room=%s play_now track %s (remaining queue: %d)", room_id, track.get("videoId"), len(state["queue"]))
     await sio.emit("room_state", _public_state(room_id), room=room_id)
 
+    # Pre-extract next track in queue in the background
+    if state["queue"] and state["queue"][0].get("videoId"):
+        asyncio.create_task(pre_extract_track(state["queue"][0]["videoId"]))
+
 
 @sio.on("track_started")
 async def on_track_started(sid: str, data: dict) -> None:
@@ -652,6 +714,9 @@ async def on_add_to_queue(sid: str, data: dict) -> None:
             "room=%s queued track %s (queue len=%d)",
             room_id, track.get("videoId"), len(state["queue"]),
         )
+
+    # Immediately pre-extract the queued track stream URL in the background
+    asyncio.create_task(pre_extract_track(track["videoId"]))
 
     _touch(room_id)
     await sio.emit("room_state", _public_state(room_id), room=room_id)

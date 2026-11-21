@@ -140,8 +140,9 @@ export default function RoomPage() {
             audioUnlockedRef.current = true;
           }).catch((err) => {
             console.warn('[Audio] Autoplay pending user tap:', err);
-            setAudioUnlocked(false);
-            audioUnlockedRef.current = false;
+            if (!audioUnlockedRef.current) {
+              setAudioUnlocked(false);
+            }
           });
         }
       }
@@ -168,18 +169,15 @@ export default function RoomPage() {
         return;
       }
 
-      // Audio still loading/buffering — do not force drift seek yet
-      if (audio.readyState < 3) {
-        return;
-      }
-
       const targetTime = computeTargetTime(state);
 
-      // Correct drift > 1.2 s (but not while user is dragging slider)
-      if (!isSeekingRef.current) {
+      // Correct drift > 1.2 s (only if audio is ready to seek and not scrubbing)
+      if (audio.readyState >= 2 && !isSeekingRef.current) {
         const drift = Math.abs(audio.currentTime - targetTime);
         if (drift > 1.2) {
-          audio.currentTime = targetTime;
+          try {
+            audio.currentTime = targetTime;
+          } catch {}
         }
       }
 
@@ -187,15 +185,25 @@ export default function RoomPage() {
         if (audio.paused) {
           const p = audio.play();
           if (p !== undefined) {
-            p.catch(() => {});
+            p.then(() => {
+              setAudioUnlocked(true);
+              audioUnlockedRef.current = true;
+            }).catch((err) => {
+              console.warn('[Audio] syncAudio play pending user interaction:', err);
+              if (!audioUnlockedRef.current) {
+                setAudioUnlocked(false);
+              }
+            });
           }
         }
       } else {
         if (!audio.paused) {
           audio.pause();
         }
-        if (!isSeekingRef.current) {
-          audio.currentTime = state.anchorTime;
+        if (!isSeekingRef.current && audio.readyState >= 2) {
+          try {
+            audio.currentTime = state.anchorTime;
+          } catch {}
         }
       }
     },
@@ -367,52 +375,94 @@ export default function RoomPage() {
       }
     }
 
+    function onCanPlay() {
+      const state = roomStateRef.current;
+      if (!state || !state.isPlaying || !state.currentTrack) return;
+      const target = computeTargetTime(state);
+      if (Math.abs(audio!.currentTime - target) > 1.2) {
+        try {
+          audio!.currentTime = target;
+        } catch {}
+      }
+      if (audio!.paused) {
+        const p = audio!.play();
+        if (p !== undefined) {
+          p.then(() => {
+            setAudioUnlocked(true);
+            audioUnlockedRef.current = true;
+          }).catch((err) => {
+            console.warn('[Audio] Autoplay on canplay blocked:', err);
+            if (!audioUnlockedRef.current) {
+              setAudioUnlocked(false);
+            }
+          });
+        }
+      }
+    }
+
+    function onError() {
+      const err = audio!.error;
+      console.error('[Audio] Native playback error on audio element:', err?.code, err?.message, 'src:', audio!.src);
+    }
+
     audio.addEventListener('timeupdate', onTimeUpdate);
     audio.addEventListener('durationchange', onDurationChange);
     audio.addEventListener('playing', onPlaying);
     audio.addEventListener('ended', onEnded);
+    audio.addEventListener('error', onError);
+    audio.addEventListener('canplay', onCanPlay);
 
     return () => {
       audio.removeEventListener('timeupdate', onTimeUpdate);
       audio.removeEventListener('durationchange', onDurationChange);
       audio.removeEventListener('playing', onPlaying);
       audio.removeEventListener('ended', onEnded);
+      audio.removeEventListener('error', onError);
+      audio.removeEventListener('canplay', onCanPlay);
     };
   }, [roomId, backendUrl]);
 
   // ── User Joins Room Action (Single Gesture Audio Unlock & Sync) ──
   async function handleJoinRoomAction() {
     sessionStorage.setItem(`l2g_joined_${roomId}`, 'true');
-    setHasJoined(true);
     setupAudioSession();
+    setAudioUnlocked(true);
+    audioUnlockedRef.current = true;
+    setHasJoined(true);
 
     const audio = audioRef.current;
     const state = roomStateRef.current;
 
-    if (audio && state?.currentTrack && state.isPlaying) {
+    if (audio && state?.currentTrack) {
       const targetTime = computeTargetTime(state);
       const src = `${backendUrl}/api/stream/${state.currentTrack.videoId}`;
-      audio.src = src;
+      if (audio.src !== src) {
+        audio.src = src;
+      }
       if (targetTime > 0.5) {
         try {
           audio.currentTime = targetTime;
         } catch {}
       }
-      try {
-        await audio.play();
-        setAudioUnlocked(true);
-        audioUnlockedRef.current = true;
-      } catch (err) {
-        console.warn('Autoplay error on join:', err);
+      if (state.isPlaying) {
+        const p = audio.play();
+        if (p !== undefined) {
+          p.then(() => {
+            setAudioUnlocked(true);
+            audioUnlockedRef.current = true;
+          }).catch((err) => {
+            console.warn('[Audio] Autoplay error on join action:', err);
+          });
+        }
       }
     } else if (audio) {
       // Prime audio element for background playback
       try {
-        await audio.play();
-        audio.pause();
+        const p = audio.play();
+        if (p !== undefined) {
+          p.then(() => audio.pause()).catch(() => {});
+        }
       } catch {}
-      setAudioUnlocked(true);
-      audioUnlockedRef.current = true;
     }
   }
 
@@ -571,22 +621,52 @@ export default function RoomPage() {
     }
   }
 
-  async function handleUnlockAudio() {
+  function handleUnlockAudio() {
+    console.log('[Audio] handleUnlockAudio triggered');
     const audio = audioRef.current;
     if (!audio) return;
+
     setupAudioSession();
-    const state = roomStateRef.current;
-    if (state?.currentTrack && state.isPlaying) {
-      const target = computeTargetTime(state);
-      if (target > 0.5) {
-        try { audio.currentTime = target; } catch {}
-      }
-    }
-    try {
-      await audio.play();
-    } catch {}
+
+    // 1. Immediately mark unlocked so the overlay disappears instantly without freezing
     setAudioUnlocked(true);
     audioUnlockedRef.current = true;
+
+    const state = roomStateRef.current;
+    if (!state?.currentTrack) return;
+
+    // 2. Ensure audio.src points to the active track
+    const targetSrc = `${backendUrl}/api/stream/${state.currentTrack.videoId}`;
+    if (audio.src !== targetSrc) {
+      console.log('[Audio] Setting audio.src to:', targetSrc);
+      audio.src = targetSrc;
+    }
+
+    // 3. Seek to target synchronized position
+    const target = computeTargetTime(state);
+    if (target > 0.5) {
+      if (audio.readyState >= 1) {
+        try { audio.currentTime = target; } catch {}
+      } else {
+        const onMeta = () => {
+          try { audio.currentTime = target; } catch {}
+          audio.removeEventListener('loadedmetadata', onMeta);
+        };
+        audio.addEventListener('loadedmetadata', onMeta);
+      }
+    }
+
+    // 4. Begin playback asynchronously without blocking the UI
+    if (state.isPlaying) {
+      const p = audio.play();
+      if (p !== undefined) {
+        p.then(() => {
+          console.log('[Audio] Playback started successfully');
+        }).catch((err) => {
+          console.error('[Audio] play() error in handleUnlockAudio:', err);
+        });
+      }
+    }
   }
 
   function handleCreateSpecificRoom(code: string) {
@@ -601,170 +681,150 @@ export default function RoomPage() {
   const isPlaying = roomState?.isPlaying ?? false;
   const seekMax = duration > 0 ? duration : track?.duration ?? 100;
 
-  // ─── Room Not Found Screen ───
-  if (roomNotFound) {
-    return (
-      <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center px-4">
-        <div className="bg-gray-800 border border-gray-700 rounded-3xl p-8 max-w-md w-full text-center space-y-6 shadow-2xl">
-          <div className="w-16 h-16 bg-red-500/10 text-red-400 rounded-full flex items-center justify-center mx-auto text-3xl">
-            🔍
-          </div>
-          <div className="space-y-2">
-            <h1 className="text-2xl font-bold text-white">Room Not Found</h1>
-            <p className="text-gray-400 text-sm">
-              Room <span className="font-mono font-bold text-sky-400 px-2 py-0.5 bg-gray-900 rounded">{roomId}</span> does not exist or has expired due to inactivity.
-            </p>
-          </div>
-          <div className="space-y-3 pt-2">
-            <button
-              onClick={() => handleCreateSpecificRoom(roomId)}
-              className="w-full bg-sky-500 hover:bg-sky-400 active:bg-sky-600 text-white font-semibold py-3 rounded-xl transition text-sm shadow-lg shadow-sky-900/40 cursor-pointer"
-            >
-              Create Room &ldquo;{roomId}&rdquo;
-            </button>
-            <button
-              onClick={() => router.push('/')}
-              className="w-full bg-gray-700 hover:bg-gray-600 active:bg-gray-800 text-white font-semibold py-3 rounded-xl transition text-sm cursor-pointer"
-            >
-              Return to Home
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ─── Direct Join Screen for Visitors ───
-  if (!hasJoined) {
-    return (
-      <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center px-4 py-12 relative overflow-hidden">
-        {/* Hidden native audio element */}
-        {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-        <audio
-          ref={audioRef}
-          playsInline
-          crossOrigin="anonymous"
-          preload="auto"
-          className="hidden"
-        />
-
-        <div className="w-full max-w-sm flex flex-col items-center space-y-6 z-10">
-          {/* Logo */}
-          <div className="flex flex-col items-center gap-1.5">
-            <div className="flex items-center gap-3">
-              <div className="flex items-end gap-[3px] h-7">
-                {[0.6, 1, 0.8, 1.2, 0.7].map((scale, i) => (
-                  <span
-                    key={i}
-                    className="block w-1.5 bg-sky-400 rounded-full animate-wave"
-                    style={{
-                      height: `${scale * 20}px`,
-                      animationDelay: `${i * 0.12}s`,
-                    }}
-                  />
-                ))}
-              </div>
-              <h1 className="text-3xl font-extrabold tracking-tight text-white">
-                Listen<span className="text-sky-400">2Gether</span>
-              </h1>
-            </div>
-            <span className="text-[11px] font-bold tracking-widest text-sky-400 bg-sky-500/10 px-2.5 py-0.5 rounded-full border border-sky-500/20">
-              L2G
-            </span>
-          </div>
-
-          {/* Join Card */}
-          <div className="w-full bg-gray-800 border border-gray-700 rounded-3xl p-6 shadow-2xl space-y-6 text-center">
-            <div className="inline-block bg-gray-900/80 border border-gray-700 px-3 py-1 rounded-full text-xs font-mono text-sky-400 tracking-wider">
-              ROOM: {roomId}
-            </div>
-
-            {track ? (
-              <div className="space-y-4">
-                <div className="relative w-40 h-40 mx-auto rounded-2xl overflow-hidden shadow-xl border border-gray-700 bg-gray-900">
-                  <Image
-                    src={track.thumbnail}
-                    alt={track.title}
-                    fill
-                    sizes="160px"
-                    className="object-cover"
-                    unoptimized
-                  />
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent flex items-end justify-center pb-2">
-                    <div className="flex items-center gap-1.5 bg-black/60 backdrop-blur-md px-2.5 py-1 rounded-full text-[11px] text-emerald-400 font-medium">
-                      <MusicWaveIcon playing={isPlaying} />
-                      <span>{isPlaying ? 'Playing Now' : 'Paused'}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="space-y-1">
-                  <p className="font-bold text-white text-base leading-snug line-clamp-2">
-                    {track.title}
-                  </p>
-                  <p className="text-xs text-gray-400 truncate">{track.artist}</p>
-                </div>
-              </div>
-            ) : (
-              <div className="py-6 space-y-2 text-gray-400">
-                <div className="w-14 h-14 bg-gray-700/50 rounded-2xl flex items-center justify-center mx-auto text-2xl">
-                  🎧
-                </div>
-                <h3 className="font-bold text-white text-sm">Room is ready</h3>
-                <p className="text-xs text-gray-400">
-                  Join in to choose music and listen together!
-                </p>
-              </div>
-            )}
-
-            <button
-              onClick={handleJoinRoomAction}
-              className="w-full bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white font-bold py-4 rounded-2xl transition-all text-sm shadow-xl shadow-emerald-900/50 cursor-pointer flex items-center justify-center gap-2 transform active:scale-98"
-            >
-              <span>🎧</span>
-              {track ? 'Join Room & Start Listening' : 'Join Room'}
-            </button>
-          </div>
-
-          <p className="text-gray-500 text-xs text-center">
-            Zero setup. Starts playing in real-time sync with host.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  // ─── Main Room Player Screen ───
   return (
-    <div className="min-h-screen bg-gray-900 text-white flex flex-col">
-      {/* Hidden native audio element */}
+    <div className="min-h-screen bg-gray-900 text-white flex flex-col relative">
+      {/* Hidden native audio element - SINGLE PERSISTENT INSTANCE FOR LIFETIME OF ROOM */}
       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
       <audio
         ref={audioRef}
         playsInline
-        crossOrigin="anonymous"
         preload="auto"
         className="hidden"
       />
 
-      {/* ── Audio Tap-to-Unlock Overlay (fallback if audio is paused by browser) ── */}
-      {isPlaying && !audioUnlocked && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
-          <button
-            onClick={handleUnlockAudio}
-            className="flex flex-col items-center gap-4 bg-gray-800 border border-gray-700 rounded-3xl px-10 py-10 shadow-2xl active:scale-95 transition-transform cursor-pointer"
-          >
-            <span className="text-5xl">🎵</span>
-            <span className="text-xl font-bold text-white">Tap to Sync Audio</span>
-            <span className="text-sm text-gray-400 text-center max-w-xs">
-              Audio playback is waiting for your tap to resume sync.
-            </span>
-            <span className="mt-2 bg-sky-500 text-white px-8 py-3 rounded-full font-semibold text-sm">
-              Sync Audio
-            </span>
-          </button>
+      {roomNotFound ? (
+        <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center px-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-3xl p-8 max-w-md w-full text-center space-y-6 shadow-2xl">
+            <div className="w-16 h-16 bg-red-500/10 text-red-400 rounded-full flex items-center justify-center mx-auto text-3xl">
+              🔍
+            </div>
+            <div className="space-y-2">
+              <h1 className="text-2xl font-bold text-white">Room Not Found</h1>
+              <p className="text-gray-400 text-sm">
+                Room <span className="font-mono font-bold text-sky-400 px-2 py-0.5 bg-gray-900 rounded">{roomId}</span> does not exist or has expired due to inactivity.
+              </p>
+            </div>
+            <div className="space-y-3 pt-2">
+              <button
+                onClick={() => handleCreateSpecificRoom(roomId)}
+                className="w-full bg-sky-500 hover:bg-sky-400 active:bg-sky-600 text-white font-semibold py-3 rounded-xl transition text-sm shadow-lg shadow-sky-900/40 cursor-pointer"
+              >
+                Create Room &ldquo;{roomId}&rdquo;
+              </button>
+              <button
+                onClick={() => router.push('/')}
+                className="w-full bg-gray-700 hover:bg-gray-600 active:bg-gray-800 text-white font-semibold py-3 rounded-xl transition text-sm cursor-pointer"
+              >
+                Return to Home
+              </button>
+            </div>
+          </div>
         </div>
-      )}
+      ) : !hasJoined ? (
+        <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center px-4 py-12 relative overflow-hidden">
+          <div className="w-full max-w-sm flex flex-col items-center space-y-6 z-10">
+            {/* Logo */}
+            <div className="flex flex-col items-center gap-1.5">
+              <div className="flex items-center gap-3">
+                <div className="flex items-end gap-[3px] h-7">
+                  {[0.6, 1, 0.8, 1.2, 0.7].map((scale, i) => (
+                    <span
+                      key={i}
+                      className="block w-1.5 bg-sky-400 rounded-full animate-wave"
+                      style={{
+                        height: `${scale * 20}px`,
+                        animationDelay: `${i * 0.12}s`,
+                      }}
+                    />
+                  ))}
+                </div>
+                <h1 className="text-3xl font-extrabold tracking-tight text-white">
+                  Listen<span className="text-sky-400">2Gether</span>
+                </h1>
+              </div>
+              <span className="text-[11px] font-bold tracking-widest text-sky-400 bg-sky-500/10 px-2.5 py-0.5 rounded-full border border-sky-500/20">
+                L2G
+              </span>
+            </div>
+
+            {/* Join Card */}
+            <div className="w-full bg-gray-800 border border-gray-700 rounded-3xl p-6 shadow-2xl space-y-6 text-center">
+              <div className="inline-block bg-gray-900/80 border border-gray-700 px-3 py-1 rounded-full text-xs font-mono text-sky-400 tracking-wider">
+                ROOM: {roomId}
+              </div>
+
+              {track ? (
+                <div className="space-y-4">
+                  <div className="relative w-40 h-40 mx-auto rounded-2xl overflow-hidden shadow-xl border border-gray-700 bg-gray-900">
+                    <Image
+                      src={track.thumbnail}
+                      alt={track.title}
+                      fill
+                      sizes="160px"
+                      className="object-cover"
+                      unoptimized
+                    />
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent flex items-end justify-center pb-2">
+                      <div className="flex items-center gap-1.5 bg-black/60 backdrop-blur-md px-2.5 py-1 rounded-full text-[11px] text-emerald-400 font-medium">
+                        <MusicWaveIcon playing={isPlaying} />
+                        <span>{isPlaying ? 'Playing Now' : 'Paused'}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <p className="font-bold text-white text-base leading-snug line-clamp-2">
+                      {track.title}
+                    </p>
+                    <p className="text-xs text-gray-400 truncate">{track.artist}</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="py-6 space-y-2 text-gray-400">
+                  <div className="w-14 h-14 bg-gray-700/50 rounded-2xl flex items-center justify-center mx-auto text-2xl">
+                    🎧
+                  </div>
+                  <h3 className="font-bold text-white text-sm">Room is ready</h3>
+                  <p className="text-xs text-gray-400">
+                    Join in to choose music and listen together!
+                  </p>
+                </div>
+              )}
+
+              <button
+                onClick={handleJoinRoomAction}
+                className="w-full bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white font-bold py-4 rounded-2xl transition-all text-sm shadow-xl shadow-emerald-900/50 cursor-pointer flex items-center justify-center gap-2 transform active:scale-98"
+              >
+                <span>🎧</span>
+                {track ? 'Join Room & Start Listening' : 'Join Room'}
+              </button>
+            </div>
+
+            <p className="text-gray-500 text-xs text-center">
+              Zero setup. Starts playing in real-time sync with host.
+            </p>
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* ── Audio Tap-to-Unlock Overlay (fallback if audio is paused by browser) ── */}
+          {isPlaying && !audioUnlocked && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+              <button
+                onClick={handleUnlockAudio}
+                className="flex flex-col items-center gap-4 bg-gray-800 border border-gray-700 rounded-3xl px-10 py-10 shadow-2xl active:scale-95 transition-transform cursor-pointer"
+              >
+                <span className="text-5xl">🎵</span>
+                <span className="text-xl font-bold text-white">Tap to Sync Audio</span>
+                <span className="text-sm text-gray-400 text-center max-w-xs">
+                  Audio playback is waiting for your tap to resume sync.
+                </span>
+                <span className="mt-2 bg-sky-500 text-white px-8 py-3 rounded-full font-semibold text-sm">
+                  Sync Audio
+                </span>
+              </button>
+            </div>
+          )}
 
       {/* ── Top Bar ── */}
       <header className="flex items-center justify-between px-4 py-3 border-b border-gray-800 bg-gray-900/90 backdrop-blur sticky top-0 z-30">
@@ -1134,6 +1194,8 @@ export default function RoomPage() {
           <span className="text-gray-600">Listen2Gether (L2G) — Synchronized Audio</span>
         </div>
       </main>
+        </>
+      )}
     </div>
   );
 }
