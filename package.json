@@ -1,0 +1,12 @@
+{
+  "name": "syncwave-root",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm run start:all",
+    "dev:backend": "cd backend && (test -d venv && ./venv/bin/uvicorn main:app --reload --port 8000 || python3 -m uvicorn main:app --reload --port 8000)",
+    "dev:frontend": "cd frontend && npm run dev",
+    "start:all": "./start.sh",
+    "install:all": "./setup.sh"
+  }
+}

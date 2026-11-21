@@ -46,6 +46,26 @@ SyncWave/
 
 ---
 
+## Quick Start (Single Command)
+
+To run both backend and frontend concurrently in development with one command:
+
+```bash
+./start.sh
+# or from root:
+npm run dev
+```
+
+If you're cloning fresh or need to set up/update both environments at once:
+
+```bash
+./setup.sh
+# or from root:
+npm run install:all
+```
+
+---
+
 ## Local Development
 
 ### Prerequisites
