@@ -110,7 +110,10 @@ Open `http://localhost:3000` in your browser.
 
 ## Production Deployment
 
-### Backend → Render (Docker Web Service)
+### Option A: Standard Multi-Service Deployment (Recommended)
+You deploy the **Backend on Render** and the **Frontend on Vercel**. In this architecture, `gateway.js` is not needed because Vercel talks directly to the Render backend domain.
+
+#### Backend → Render (Docker Web Service)
 
 1. Push the repo to GitHub.
 2. In the [Render dashboard](https://dashboard.render.com), click **New → Web Service**.
@@ -120,16 +123,16 @@ Open `http://localhost:3000` in your browser.
 
    | Key | Value |
    |-----|-------|
-   | `FRONTEND_URL` | Comma-separated allowed origins, e.g. `https://syncwave.vercel.app,https://www.syncwave.vercel.app` |
+   | `FRONTEND_URL` | Comma-separated allowed origins, e.g. `https://listen2gether.vercel.app,https://www.listen2gether.vercel.app` |
    | `PORT` | `8000` |
    | `YTDLP_COOKIES_B64` | *(optional)* Base64-encoded Netscape cookies file for age-restricted videos |
 
-6. Deploy. Note the service URL (e.g. `https://syncwave-api.onrender.com`).
+6. Deploy. Note the service URL (e.g. `https://listen2gether-api.onrender.com`).
 
 > [!NOTE]
-> Free-tier Render services spin down after ~15 minutes of inactivity. The first request after a cold start may take 30–60 seconds. Upgrade to a paid instance or use a cron ping service to keep it warm.
+> Free-tier Render services spin down after ~15 minutes of inactivity. Point your UptimeRobot monitor to `https://listen2gether-api.onrender.com/health` (10-minute interval) to keep it warm!
 
-### Frontend → Vercel
+#### Frontend → Vercel
 
 1. In the [Vercel dashboard](https://vercel.com/new), import your GitHub repo.
 2. Set **Root Directory** to `frontend`.
@@ -137,10 +140,17 @@ Open `http://localhost:3000` in your browser.
 
    | Key | Value |
    |-----|-------|
-   | `NEXT_PUBLIC_BACKEND_URL` | Your Render service URL, e.g. `https://syncwave-api.onrender.com` |
-   | `NEXT_PUBLIC_APP_URL` | Your Vercel URL, e.g. `https://syncwave.vercel.app` |
+   | `NEXT_PUBLIC_BACKEND_URL` | Your Render service URL, e.g. `https://listen2gether-api.onrender.com` |
+   | `NEXT_PUBLIC_APP_URL` | Your Vercel URL, e.g. `https://listen2gether.vercel.app` |
 
 4. Deploy. Vercel handles build (`npm run build`) and serving automatically.
+
+---
+
+### Option B: Single-Container / VPS Deployment (Using Gateway)
+If you are deploying everything together on a single server, VPS (DigitalOcean/EC2), or single tunnel (like ngrok):
+- Start all services with `./start.sh` or `npm run start`.
+- Route traffic to port `3000` (`gateway.js`), which acts as the unified reverse proxy forwarding `/api`, `/socket.io`, and `/health` to the backend and all UI routes to Next.js.
 
 ---
 
