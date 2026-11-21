@@ -136,6 +136,9 @@ async def advance_track(room_id: str) -> None:
 
     if state["queue"]:
         next_track = state["queue"].pop(0)
+        vid = next_track.get("videoId")
+        # Remove any remaining copies of next_track from queue
+        state["queue"] = [q for q in state["queue"] if q.get("videoId") != vid]
         state["currentTrack"] = next_track
         state["isPlaying"] = True
         state["anchorTime"] = 0.0
@@ -551,7 +554,7 @@ async def on_seek(sid: str, data: dict) -> None:
 @sio.on("play_now")
 async def on_play_now(sid: str, data: dict) -> None:
     """
-    data: { roomId: str, track: { videoId, title, artist, duration, thumbnail } }
+    data: { roomId: str, track: { videoId, title, artist, duration, thumbnail }, queueIndex?: int }
     """
     room_id: str = data.get("roomId", "").strip().upper()
     state = room_state.get(room_id)
@@ -562,6 +565,14 @@ async def on_play_now(sid: str, data: dict) -> None:
     if not track or not track.get("videoId"):
         await sio.emit("error", {"message": "Invalid track"}, to=sid)
         return
+
+    # If this track is in the queue, remove it by index or videoId
+    queue_index = data.get("queueIndex")
+    if queue_index is not None and isinstance(queue_index, int) and 0 <= queue_index < len(state["queue"]):
+        state["queue"].pop(queue_index)
+    else:
+        vid = track.get("videoId")
+        state["queue"] = [q for q in state["queue"] if q.get("videoId") != vid]
 
     # Push old track to history
     if state.get("currentTrack"):
@@ -576,8 +587,34 @@ async def on_play_now(sid: str, data: dict) -> None:
     state["anchorTime"] = 0.0
     state["anchorTimestamp"] = int(time.time() * 1000)
     _touch(room_id)
-    log.info("room=%s play_now track %s", room_id, track.get("videoId"))
+    log.info("room=%s play_now track %s (remaining queue: %d)", room_id, track.get("videoId"), len(state["queue"]))
     await sio.emit("room_state", _public_state(room_id), room=room_id)
+
+
+@sio.on("track_started")
+async def on_track_started(sid: str, data: dict) -> None:
+    """
+    Fired when audio actually begins playing sound in a client's player,
+    preventing stream extraction/buffering latency from skipping the song intro.
+    """
+    room_id: str = data.get("roomId", "").strip().upper()
+    state = room_state.get(room_id)
+    if state is None:
+        return
+
+    vid = data.get("videoId")
+    current_vid = state.get("currentTrack", {}).get("videoId")
+    if vid and current_vid != vid:
+        return
+
+    current_time = float(data.get("currentTime", 0.0))
+    # Re-anchor if track is near start and anchor was 0
+    if state["anchorTime"] <= 1.0 and current_time < 3.0:
+        state["anchorTime"] = current_time
+        state["anchorTimestamp"] = int(time.time() * 1000)
+        _touch(room_id)
+        log.info("room=%s track_started anchored to %.2f at %d", room_id, current_time, state["anchorTimestamp"])
+        await sio.emit("room_state", _public_state(room_id), room=room_id)
 
 
 @sio.on("add_to_queue")
