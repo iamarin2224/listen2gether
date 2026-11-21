@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * SyncWave Unified Gateway
+ * Listen2Gether (L2G) Unified Gateway
  *
  * Listens on PORT 3000 (the single port you tunnel via ngrok).
  * Proxies:
@@ -105,7 +105,7 @@ server.on('upgrade', (req, clientSocket, head) => {
 
 server.listen(GATEWAY_PORT, '0.0.0.0', () => {
   console.log(`==========================================================`);
-  console.log(` SyncWave Gateway running on http://0.0.0.0:${GATEWAY_PORT}`);
+  console.log(` Listen2Gether (L2G) Gateway running on http://0.0.0.0:${GATEWAY_PORT}`);
   console.log(`   -> /api & /socket.io (HTTP + WS) routed to backend (8000)`);
   console.log(`   -> Frontend pages routed to Next.js (3001)`);
   console.log(` Single-tunnel ready: "ngrok http ${GATEWAY_PORT}"`);

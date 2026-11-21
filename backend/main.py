@@ -1,5 +1,5 @@
 """
-SyncWave Backend — FastAPI + python-socketio
+Listen2Gether (L2G) Backend — FastAPI + python-socketio
 Real-time synchronised music listening via yt-dlp audio proxy.
 """
 
@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("syncwave")
+log = logging.getLogger("listen2gether")
 
 FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
@@ -179,14 +179,14 @@ async def _cleanup_rooms() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(_cleanup_rooms())
-    log.info("SyncWave backend started. Allowed origins: %s", ALLOWED_ORIGINS)
+    log.info("Listen2Gether backend started. Allowed origins: %s", ALLOWED_ORIGINS)
     yield
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
-    log.info("SyncWave backend shut down.")
+    log.info("Listen2Gether backend shut down.")
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +205,7 @@ sio = socketio.AsyncServer(
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="SyncWave API", lifespan=lifespan)
+app = FastAPI(title="Listen2Gether (L2G) API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

@@ -61,8 +61,8 @@ export default function RoomPage() {
   // ── State ──
   const [hasJoined, setHasJoined] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
-    const isCreator = sessionStorage.getItem(`syncwave_created_${roomId}`) === 'true';
-    const isJoined = sessionStorage.getItem(`syncwave_joined_${roomId}`) === 'true';
+    const isCreator = sessionStorage.getItem(`l2g_created_${roomId}`) === 'true';
+    const isJoined = sessionStorage.getItem(`l2g_joined_${roomId}`) === 'true';
     return isCreator || isJoined;
   });
 
@@ -207,7 +207,7 @@ export default function RoomPage() {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: track.title,
       artist: track.artist,
-      album: 'SyncWave',
+      album: 'Listen2Gether (L2G)',
       artwork: [
         { src: track.thumbnail, sizes: '480x360', type: 'image/jpeg' },
       ],
@@ -256,7 +256,7 @@ export default function RoomPage() {
     const socket = getSocket(backendUrl);
     socketRef.current = socket;
 
-    const isCreated = typeof window !== 'undefined' && sessionStorage.getItem(`syncwave_created_${roomId}`) === 'true';
+    const isCreated = typeof window !== 'undefined' && sessionStorage.getItem(`l2g_created_${roomId}`) === 'true';
 
     socket.on('connect', () => {
       setConnStatus('synced');
@@ -381,7 +381,7 @@ export default function RoomPage() {
 
   // ── User Joins Room Action (Single Gesture Audio Unlock & Sync) ──
   async function handleJoinRoomAction() {
-    sessionStorage.setItem(`syncwave_joined_${roomId}`, 'true');
+    sessionStorage.setItem(`l2g_joined_${roomId}`, 'true');
     setHasJoined(true);
     setupAudioSession();
 
@@ -563,8 +563,8 @@ export default function RoomPage() {
   async function handleShare() {
     if (navigator.share) {
       await navigator.share({
-        title: 'SyncWave Room',
-        text: `Join my SyncWave room: ${roomId}`,
+        title: 'Listen2Gether (L2G) Room',
+        text: `Join my Listen2Gether room: ${roomId}`,
         url: window.location.href,
       }).catch(() => {});
     }
@@ -589,7 +589,7 @@ export default function RoomPage() {
   }
 
   function handleCreateSpecificRoom(code: string) {
-    sessionStorage.setItem(`syncwave_created_${code}`, 'true');
+    sessionStorage.setItem(`l2g_created_${code}`, 'true');
     setRoomNotFound(false);
     socketRef.current?.emit('join_room', { roomId: code, displayName: 'Listener', create: true });
   }
@@ -649,22 +649,27 @@ export default function RoomPage() {
 
         <div className="w-full max-w-sm flex flex-col items-center space-y-6 z-10">
           {/* Logo */}
-          <div className="flex items-center gap-3">
-            <div className="flex items-end gap-[3px] h-7">
-              {[0.6, 1, 0.8, 1.2, 0.7].map((scale, i) => (
-                <span
-                  key={i}
-                  className="block w-1.5 bg-sky-400 rounded-full animate-wave"
-                  style={{
-                    height: `${scale * 20}px`,
-                    animationDelay: `${i * 0.12}s`,
-                  }}
-                />
-              ))}
+          <div className="flex flex-col items-center gap-1.5">
+            <div className="flex items-center gap-3">
+              <div className="flex items-end gap-[3px] h-7">
+                {[0.6, 1, 0.8, 1.2, 0.7].map((scale, i) => (
+                  <span
+                    key={i}
+                    className="block w-1.5 bg-sky-400 rounded-full animate-wave"
+                    style={{
+                      height: `${scale * 20}px`,
+                      animationDelay: `${i * 0.12}s`,
+                    }}
+                  />
+                ))}
+              </div>
+              <h1 className="text-3xl font-extrabold tracking-tight text-white">
+                Listen<span className="text-sky-400">2Gether</span>
+              </h1>
             </div>
-            <h1 className="text-3xl font-extrabold tracking-tight text-white">
-              Sync<span className="text-sky-400">Wave</span>
-            </h1>
+            <span className="text-[11px] font-bold tracking-widest text-sky-400 bg-sky-500/10 px-2.5 py-0.5 rounded-full border border-sky-500/20">
+              L2G
+            </span>
           </div>
 
           {/* Join Card */}
@@ -764,9 +769,14 @@ export default function RoomPage() {
       <header className="flex items-center justify-between px-4 py-3 border-b border-gray-800 bg-gray-900/90 backdrop-blur sticky top-0 z-30">
         <button
           onClick={() => router.push('/')}
-          className="text-sky-400 font-extrabold text-lg tracking-tight cursor-pointer"
+          className="flex items-center gap-2 cursor-pointer"
         >
-          Sync<span className="text-white">Wave</span>
+          <span className="text-sky-400 font-extrabold text-lg tracking-tight">
+            Listen<span className="text-white">2Gether</span>
+          </span>
+          <span className="text-[10px] font-bold text-sky-400 bg-sky-500/10 px-1.5 py-0.5 rounded border border-sky-500/20">
+            L2G
+          </span>
         </button>
 
         {/* Connection pill */}
@@ -1120,7 +1130,7 @@ export default function RoomPage() {
           <span>
             Room: <span className="font-mono text-gray-300 font-bold">{roomId}</span>
           </span>
-          <span className="text-gray-600">SyncWave — Synchronized Audio</span>
+          <span className="text-gray-600">Listen2Gether (L2G) — Synchronized Audio</span>
         </div>
       </main>
     </div>

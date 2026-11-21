@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$ROOT_DIR/backend"
 FRONTEND_DIR="$ROOT_DIR/frontend"
 
-echo "=== SyncWave Environment Setup ==="
+echo "=== Listen2Gether (L2G) Environment Setup ==="
 
 # Backend setup
 echo "[1/2] Setting up Backend..."

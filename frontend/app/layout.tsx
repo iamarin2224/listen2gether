@@ -2,7 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "SyncWave",
+  title: "Listen2Gether (L2G)",
   description: "Real-time synchronized music listening — listen together, in perfect sync.",
 };
 

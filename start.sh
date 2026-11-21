@@ -27,7 +27,7 @@ elif [ -f "$BACKEND_DIR/.venv/bin/uvicorn" ]; then
 fi
 
 echo "=========================================================="
-echo " Starting SyncWave (Backend + Frontend + Unified Gateway)"
+echo " Starting Listen2Gether (L2G) (Backend + Frontend + Unified Gateway)"
 echo "   Gateway (Main URL / Tunnel): http://localhost:3000"
 echo "   Next.js Internal:            http://localhost:3001"
 echo "   FastAPI Backend Internal:    http://localhost:8000"
@@ -37,7 +37,7 @@ echo "=========================================================="
 
 cleanup() {
     echo ""
-    echo "Stopping SyncWave servers..."
+    echo "Stopping Listen2Gether (L2G) servers..."
     kill "$GATEWAY_PID" "$BACKEND_PID" "$FRONTEND_PID" 2>/dev/null
     wait "$GATEWAY_PID" "$BACKEND_PID" "$FRONTEND_PID" 2>/dev/null
     echo "All processes stopped."

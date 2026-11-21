@@ -48,7 +48,7 @@ export default function HomePage() {
   async function handleCreateRoom() {
     setIsCreating(true);
     const slug = generateRoomCode();
-    sessionStorage.setItem(`syncwave_created_${slug}`, 'true');
+    sessionStorage.setItem(`l2g_created_${slug}`, 'true');
     try {
       await fetch('/api/rooms', {
         method: 'POST',
@@ -76,8 +76,11 @@ export default function HomePage() {
         <div className="flex items-center gap-3">
           <MusicWaveIcon />
           <h1 className="text-4xl font-extrabold tracking-tight text-white">
-            Sync<span className="text-sky-400">Wave</span>
+            Listen<span className="text-sky-400">2Gether</span>
           </h1>
+        </div>
+        <div className="inline-block px-2.5 py-0.5 rounded-full text-[11px] font-bold tracking-widest bg-sky-500/10 text-sky-400 border border-sky-500/20">
+          L2G
         </div>
         <p className="text-gray-400 text-center max-w-xs text-sm leading-relaxed">
           Listen together in perfect sync — anywhere, any device.

@@ -1,4 +1,4 @@
-# 🎵 SyncWave
+# 🎵 Listen2Gether (L2G)
 
 **Real-time synchronized music listening for groups.** Share a room code, everyone hears the same track at the same moment — including on iOS Safari in the background.
 
@@ -20,7 +20,7 @@
 ## Project Structure
 
 ```
-SyncWave/
+listen2gether/
 ├── README.md
 ├── backend/
 │   ├── Dockerfile
@@ -146,11 +146,11 @@ Open `http://localhost:3000` in your browser.
 
 ## iOS Background Audio
 
-Keeping audio alive on iOS Safari when the screen locks requires a specific architecture. SyncWave implements all necessary pieces:
+Keeping audio alive on iOS Safari when the screen locks requires a specific architecture. Listen2Gether implements all necessary pieces:
 
 ### 1 — Native `<audio>` element, never an iframe
 
-YouTube iframes are killed by iOS when the page loses focus. SyncWave proxies audio through the backend and feeds it directly into a native `<audio>` element, which iOS treats as a first-class media source.
+YouTube iframes are killed by iOS when the page loses focus. Listen2Gether proxies audio through the backend and feeds it directly into a native `<audio>` element, which iOS treats as a first-class media source.
 
 ### 2 — HTTP 206 range proxy (`/api/stream/:videoId`)
 
@@ -170,7 +170,7 @@ iOS requires a user gesture to unlock the audio context. On first load a full-sc
 
 ### 6 — No `visibilitychange` or `pagehide` pause listeners
 
-Many audio players pause on tab switch or screen lock via `document.addEventListener('visibilitychange', ...)`. SyncWave deliberately omits these handlers so the audio context is never interrupted by iOS lifecycle events.
+Many audio players pause on tab switch or screen lock via `document.addEventListener('visibilitychange', ...)`. Listen2Gether deliberately omits these handlers so the audio context is never interrupted by iOS lifecycle events.
 
 ---
 
