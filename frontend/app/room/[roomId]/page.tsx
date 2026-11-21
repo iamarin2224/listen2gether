@@ -44,29 +44,15 @@ export default function RoomPage() {
   const roomId = ((params?.roomId as string) ?? '').toUpperCase();
 
   // Determine backend URL dynamically:
-  const [backendUrl, setBackendUrl] = useState<string>(() => {
-    return (process.env.NEXT_PUBLIC_BACKEND_URL ?? '').replace(/\/$/, '');
-  });
-
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-      // Only fallback to window.location.origin if running on localhost with gateway/ngrok tunnel
-      // Never override a configured production NEXT_PUBLIC_BACKEND_URL on Vercel!
-      if (isLocalHost && (!backendUrl || backendUrl.includes('localhost') || backendUrl.includes('127.0.0.1'))) {
-        setBackendUrl(window.location.origin);
-      }
-    }
-  }, [backendUrl]);
+  // On Vercel production -> use configured production Render URL.
+  // Everywhere else (ngrok tunnel, unified gateway, local network IP, localhost) -> use window.location.origin.
+  const backendUrl = typeof window !== 'undefined'
+    ? (window.location.hostname.includes('vercel.app') && process.env.NEXT_PUBLIC_BACKEND_URL && !process.env.NEXT_PUBLIC_BACKEND_URL.includes('localhost')
+        ? process.env.NEXT_PUBLIC_BACKEND_URL.replace(/\/$/, '')
+        : window.location.origin)
+    : (process.env.NEXT_PUBLIC_BACKEND_URL ?? '').replace(/\/$/, '');
 
   // ── State ──
-  const [hasJoined, setHasJoined] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false;
-    const isCreator = sessionStorage.getItem(`l2g_created_${roomId}`) === 'true';
-    const isJoined = sessionStorage.getItem(`l2g_joined_${roomId}`) === 'true';
-    return isCreator || isJoined;
-  });
-
   const [roomState, setRoomState] = useState<RoomState | null>(null);
   const [roomNotFound, setRoomNotFound] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -97,6 +83,27 @@ export default function RoomPage() {
   useEffect(() => { roomStateRef.current = roomState; }, [roomState]);
   useEffect(() => { isSeekingRef.current = isSeeking; }, [isSeeking]);
   useEffect(() => { audioUnlockedRef.current = audioUnlocked; }, [audioUnlocked]);
+
+  // Continuous timer to advance slider smoothly even before local audio finishes buffering
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const audio = audioRef.current;
+      const state = roomStateRef.current;
+      if (isSeekingRef.current) return;
+
+      if (audio && !audio.paused && audio.currentTime > 0) {
+        setCurrentTime(audio.currentTime);
+      } else if (state?.isPlaying && state.currentTrack) {
+        if (!state.isPlaying) {
+          setCurrentTime(state.anchorTime);
+        } else {
+          const elapsed = (Date.now() - state.anchorTimestamp) / 1000;
+          setCurrentTime(state.anchorTime + elapsed);
+        }
+      }
+    }, 250);
+    return () => clearInterval(timer);
+  }, []);
 
   // ── Compute target playback position ──
   const computeTargetTime = useCallback((state: RoomState): number => {
@@ -162,7 +169,7 @@ export default function RoomPage() {
       }
 
       const targetSrc = `${backendUrl}/api/stream/${state.currentTrack.videoId}`;
-      const needsSrcChange = audio.src !== targetSrc;
+      const needsSrcChange = audio.src !== targetSrc || Boolean(audio.error);
 
       if (needsSrcChange) {
         loadTrack(state.currentTrack, state.isPlaying, computeTargetTime(state));
@@ -309,14 +316,14 @@ export default function RoomPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, backendUrl]);
 
-  // ── Sync audio whenever roomState changes (only after user has joined) ──
+  // ── Sync audio whenever roomState changes ──
   useEffect(() => {
-    if (!roomState || !hasJoined) return;
+    if (!roomState) return;
     syncAudio(roomState);
     if (roomState.currentTrack) {
       updateMediaSession(roomState.currentTrack);
     }
-  }, [roomState, hasJoined, syncAudio, updateMediaSession]);
+  }, [roomState, syncAudio, updateMediaSession]);
 
   // ── audio element event wiring ──
   useEffect(() => {
@@ -324,38 +331,29 @@ export default function RoomPage() {
     if (!audio) return;
 
     function onTimeUpdate() {
-      if (!isSeekingRef.current) {
-        setCurrentTime(audio!.currentTime);
+      if (!isSeekingRef.current && audio) {
+        setCurrentTime(audio.currentTime);
       }
     }
 
     function onDurationChange() {
-      setDuration(audio!.duration);
+      if (audio) setDuration(audio.duration);
     }
 
     function onPlaying() {
       setAudioUnlocked(true);
       audioUnlockedRef.current = true;
-
-      const state = roomStateRef.current;
-      if (!state || !state.isPlaying || !state.currentTrack) return;
-
-      // When audio starts near beginning, if buffering took > 2s, anchor timestamp to actual playback start!
-      if (audio!.currentTime < 3.0 && state.anchorTime <= 1.0) {
-        const elapsed = (Date.now() - state.anchorTimestamp) / 1000;
-        if (elapsed > 2.0) {
-          socketRef.current?.emit('track_started', {
-            roomId,
-            videoId: state.currentTrack.videoId,
-            currentTime: audio!.currentTime,
-          });
-        }
-      }
     }
 
     function onEnded() {
       const state = roomStateRef.current;
-      if (!state) return;
+      if (!state || !state.currentTrack || !audio) return;
+
+      // Ignore premature false ended events
+      if (audio.currentTime < 5.0) {
+        console.warn('[Audio] Premature onEnded ignored at', audio.currentTime);
+        return;
+      }
 
       const currentVid = state.currentTrack?.videoId;
       socketRef.current?.emit('track_ended', {
@@ -367,8 +365,8 @@ export default function RoomPage() {
       if (state.queue && state.queue.length > 0) {
         const next = state.queue[0];
         const nextSrc = `${backendUrl}/api/stream/${next.videoId}`;
-        audio!.src = nextSrc;
-        const p = audio!.play();
+        audio.src = nextSrc;
+        const p = audio.play();
         if (p !== undefined) {
           p.catch(() => {});
         }
@@ -377,15 +375,15 @@ export default function RoomPage() {
 
     function onCanPlay() {
       const state = roomStateRef.current;
-      if (!state || !state.isPlaying || !state.currentTrack) return;
+      if (!state || !state.isPlaying || !state.currentTrack || !audio) return;
       const target = computeTargetTime(state);
-      if (Math.abs(audio!.currentTime - target) > 1.2) {
+      if (Math.abs(audio.currentTime - target) > 1.2) {
         try {
-          audio!.currentTime = target;
+          audio.currentTime = target;
         } catch {}
       }
-      if (audio!.paused) {
-        const p = audio!.play();
+      if (audio.paused) {
+        const p = audio.play();
         if (p !== undefined) {
           p.then(() => {
             setAudioUnlocked(true);
@@ -403,6 +401,23 @@ export default function RoomPage() {
     function onError() {
       const err = audio!.error;
       console.error('[Audio] Native playback error on audio element:', err?.code, err?.message, 'src:', audio!.src);
+      // Automatically recover after transient network, proxy, or 403 error
+      if (roomStateRef.current?.isPlaying && roomStateRef.current?.currentTrack) {
+        const track = roomStateRef.current.currentTrack;
+        setTimeout(() => {
+          if (audioRef.current && roomStateRef.current?.isPlaying && roomStateRef.current?.currentTrack?.videoId === track.videoId) {
+            console.log('[Audio] Auto-recovering from playback error for:', track.videoId);
+            const freshSrc = `${backendUrl}/api/stream/${track.videoId}?retry=${Date.now()}`;
+            audioRef.current.src = freshSrc;
+            audioRef.current.load();
+            const target = computeTargetTime(roomStateRef.current);
+            if (target > 0) {
+              try { audioRef.current.currentTime = target; } catch {}
+            }
+            audioRef.current.play().catch((e) => console.warn('[Audio] Auto-recovery play error:', e));
+          }
+        }, 1000);
+      }
     }
 
     audio.addEventListener('timeupdate', onTimeUpdate);
@@ -421,50 +436,6 @@ export default function RoomPage() {
       audio.removeEventListener('canplay', onCanPlay);
     };
   }, [roomId, backendUrl]);
-
-  // ── User Joins Room Action (Single Gesture Audio Unlock & Sync) ──
-  async function handleJoinRoomAction() {
-    sessionStorage.setItem(`l2g_joined_${roomId}`, 'true');
-    setupAudioSession();
-    setAudioUnlocked(true);
-    audioUnlockedRef.current = true;
-    setHasJoined(true);
-
-    const audio = audioRef.current;
-    const state = roomStateRef.current;
-
-    if (audio && state?.currentTrack) {
-      const targetTime = computeTargetTime(state);
-      const src = `${backendUrl}/api/stream/${state.currentTrack.videoId}`;
-      if (audio.src !== src) {
-        audio.src = src;
-      }
-      if (targetTime > 0.5) {
-        try {
-          audio.currentTime = targetTime;
-        } catch {}
-      }
-      if (state.isPlaying) {
-        const p = audio.play();
-        if (p !== undefined) {
-          p.then(() => {
-            setAudioUnlocked(true);
-            audioUnlockedRef.current = true;
-          }).catch((err) => {
-            console.warn('[Audio] Autoplay error on join action:', err);
-          });
-        }
-      }
-    } else if (audio) {
-      // Prime audio element for background playback
-      try {
-        const p = audio.play();
-        if (p !== undefined) {
-          p.then(() => audio.pause()).catch(() => {});
-        }
-      } catch {}
-    }
-  }
 
   // ── Handlers ──
 
@@ -496,15 +467,21 @@ export default function RoomPage() {
     setAudioUnlocked(true);
     audioUnlockedRef.current = true;
 
-    const audio = audioRef.current;
-    if (audio) {
-      const p = audio.play();
-      if (p !== undefined) p.catch(() => {});
-    }
+    // Immediately load and play the track on this device within the user gesture!
+    loadTrack(track, true, 0);
 
-    // Optimistically remove from queue if present
+    // Optimistically update roomState to playing
     setRoomState((prev) =>
-      prev ? { ...prev, queue: prev.queue.filter((q) => q.videoId !== track.videoId) } : null
+      prev
+        ? {
+            ...prev,
+            currentTrack: track,
+            isPlaying: true,
+            anchorTime: 0,
+            anchorTimestamp: Date.now(),
+            queue: prev.queue.filter((q) => q.videoId !== track.videoId),
+          }
+        : null
     );
 
     socketRef.current?.emit('play_now', { roomId, track });
@@ -517,15 +494,21 @@ export default function RoomPage() {
     setAudioUnlocked(true);
     audioUnlockedRef.current = true;
 
-    const audio = audioRef.current;
-    if (audio) {
-      const p = audio.play();
-      if (p !== undefined) p.catch(() => {});
-    }
+    // Immediately load and play the track on this device within the user gesture!
+    loadTrack(track, true, 0);
 
-    // Optimistically remove from queue immediately
+    // Optimistically update roomState to playing
     setRoomState((prev) =>
-      prev ? { ...prev, queue: prev.queue.filter((_, i) => i !== index) } : null
+      prev
+        ? {
+            ...prev,
+            currentTrack: track,
+            isPlaying: true,
+            anchorTime: 0,
+            anchorTimestamp: Date.now(),
+            queue: prev.queue.filter((_, i) => i !== index),
+          }
+        : null
     );
 
     socketRef.current?.emit('play_now', { roomId, track, queueIndex: index });
@@ -547,6 +530,38 @@ export default function RoomPage() {
     audioUnlockedRef.current = true;
 
     const audio = audioRef.current;
+
+    // If the room is currently playing, but this device's audio is paused locally (e.g. browser autoplay restriction):
+    // Start local playback without toggling/pausing the entire room!
+    if (audio && audio.paused && roomState.isPlaying && roomState.currentTrack) {
+      console.log('[Audio] Resuming local playback to join ongoing room audio');
+      const targetSrc = `${backendUrl}/api/stream/${roomState.currentTrack.videoId}`;
+      const target = computeTargetTime(roomState);
+
+      // If audio has an error, has no source, or wrong source: cleanly re-assign and load
+      if (audio.error || !audio.src || !audio.src.includes(roomState.currentTrack.videoId)) {
+        console.log('[Audio] Reloading fresh source on audio element to recover');
+        audio.src = targetSrc;
+        audio.load();
+      }
+
+      if (Math.abs(audio.currentTime - target) > 1.0) {
+        try {
+          audio.currentTime = target;
+        } catch {}
+      }
+      audio.play().catch((err) => {
+        console.warn('[Audio] Local play error:', err);
+        // Force recovery reload if play rejected due to unsupported/stale source
+        if (err?.name === 'NotSupportedError') {
+          audio.src = `${targetSrc}?r=${Date.now()}`;
+          audio.load();
+          audio.play().catch(() => {});
+        }
+      });
+      return;
+    }
+
     if (audio && !roomState.isPlaying) {
       const p = audio.play();
       if (p !== undefined) p.catch(() => {});
@@ -621,54 +636,6 @@ export default function RoomPage() {
     }
   }
 
-  function handleUnlockAudio() {
-    console.log('[Audio] handleUnlockAudio triggered');
-    const audio = audioRef.current;
-    if (!audio) return;
-
-    setupAudioSession();
-
-    // 1. Immediately mark unlocked so the overlay disappears instantly without freezing
-    setAudioUnlocked(true);
-    audioUnlockedRef.current = true;
-
-    const state = roomStateRef.current;
-    if (!state?.currentTrack) return;
-
-    // 2. Ensure audio.src points to the active track
-    const targetSrc = `${backendUrl}/api/stream/${state.currentTrack.videoId}`;
-    if (audio.src !== targetSrc) {
-      console.log('[Audio] Setting audio.src to:', targetSrc);
-      audio.src = targetSrc;
-    }
-
-    // 3. Seek to target synchronized position
-    const target = computeTargetTime(state);
-    if (target > 0.5) {
-      if (audio.readyState >= 1) {
-        try { audio.currentTime = target; } catch {}
-      } else {
-        const onMeta = () => {
-          try { audio.currentTime = target; } catch {}
-          audio.removeEventListener('loadedmetadata', onMeta);
-        };
-        audio.addEventListener('loadedmetadata', onMeta);
-      }
-    }
-
-    // 4. Begin playback asynchronously without blocking the UI
-    if (state.isPlaying) {
-      const p = audio.play();
-      if (p !== undefined) {
-        p.then(() => {
-          console.log('[Audio] Playback started successfully');
-        }).catch((err) => {
-          console.error('[Audio] play() error in handleUnlockAudio:', err);
-        });
-      }
-    }
-  }
-
   function handleCreateSpecificRoom(code: string) {
     sessionStorage.setItem(`l2g_created_${code}`, 'true');
     setRoomNotFound(false);
@@ -720,113 +687,9 @@ export default function RoomPage() {
             </div>
           </div>
         </div>
-      ) : !hasJoined ? (
-        <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center px-4 py-12 relative overflow-hidden">
-          <div className="w-full max-w-sm flex flex-col items-center space-y-6 z-10">
-            {/* Logo */}
-            <div className="flex flex-col items-center gap-1.5">
-              <div className="flex items-center gap-3">
-                <div className="flex items-end gap-[3px] h-7">
-                  {[0.6, 1, 0.8, 1.2, 0.7].map((scale, i) => (
-                    <span
-                      key={i}
-                      className="block w-1.5 bg-sky-400 rounded-full animate-wave"
-                      style={{
-                        height: `${scale * 20}px`,
-                        animationDelay: `${i * 0.12}s`,
-                      }}
-                    />
-                  ))}
-                </div>
-                <h1 className="text-3xl font-extrabold tracking-tight text-white">
-                  Listen<span className="text-sky-400">2Gether</span>
-                </h1>
-              </div>
-              <span className="text-[11px] font-bold tracking-widest text-sky-400 bg-sky-500/10 px-2.5 py-0.5 rounded-full border border-sky-500/20">
-                L2G
-              </span>
-            </div>
-
-            {/* Join Card */}
-            <div className="w-full bg-gray-800 border border-gray-700 rounded-3xl p-6 shadow-2xl space-y-6 text-center">
-              <div className="inline-block bg-gray-900/80 border border-gray-700 px-3 py-1 rounded-full text-xs font-mono text-sky-400 tracking-wider">
-                ROOM: {roomId}
-              </div>
-
-              {track ? (
-                <div className="space-y-4">
-                  <div className="relative w-40 h-40 mx-auto rounded-2xl overflow-hidden shadow-xl border border-gray-700 bg-gray-900">
-                    <Image
-                      src={track.thumbnail}
-                      alt={track.title}
-                      fill
-                      sizes="160px"
-                      className="object-cover"
-                      unoptimized
-                    />
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent flex items-end justify-center pb-2">
-                      <div className="flex items-center gap-1.5 bg-black/60 backdrop-blur-md px-2.5 py-1 rounded-full text-[11px] text-emerald-400 font-medium">
-                        <MusicWaveIcon playing={isPlaying} />
-                        <span>{isPlaying ? 'Playing Now' : 'Paused'}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="space-y-1">
-                    <p className="font-bold text-white text-base leading-snug line-clamp-2">
-                      {track.title}
-                    </p>
-                    <p className="text-xs text-gray-400 truncate">{track.artist}</p>
-                  </div>
-                </div>
-              ) : (
-                <div className="py-6 space-y-2 text-gray-400">
-                  <div className="w-14 h-14 bg-gray-700/50 rounded-2xl flex items-center justify-center mx-auto text-2xl">
-                    🎧
-                  </div>
-                  <h3 className="font-bold text-white text-sm">Room is ready</h3>
-                  <p className="text-xs text-gray-400">
-                    Join in to choose music and listen together!
-                  </p>
-                </div>
-              )}
-
-              <button
-                onClick={handleJoinRoomAction}
-                className="w-full bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white font-bold py-4 rounded-2xl transition-all text-sm shadow-xl shadow-emerald-900/50 cursor-pointer flex items-center justify-center gap-2 transform active:scale-98"
-              >
-                <span>🎧</span>
-                {track ? 'Join Room & Start Listening' : 'Join Room'}
-              </button>
-            </div>
-
-            <p className="text-gray-500 text-xs text-center">
-              Zero setup. Starts playing in real-time sync with host.
-            </p>
-          </div>
-        </div>
       ) : (
         <>
-          {/* ── Audio Tap-to-Unlock Overlay (fallback if audio is paused by browser) ── */}
-          {isPlaying && !audioUnlocked && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
-              <button
-                onClick={handleUnlockAudio}
-                className="flex flex-col items-center gap-4 bg-gray-800 border border-gray-700 rounded-3xl px-10 py-10 shadow-2xl active:scale-95 transition-transform cursor-pointer"
-              >
-                <span className="text-5xl">🎵</span>
-                <span className="text-xl font-bold text-white">Tap to Sync Audio</span>
-                <span className="text-sm text-gray-400 text-center max-w-xs">
-                  Audio playback is waiting for your tap to resume sync.
-                </span>
-                <span className="mt-2 bg-sky-500 text-white px-8 py-3 rounded-full font-semibold text-sm">
-                  Sync Audio
-                </span>
-              </button>
-            </div>
-          )}
-
-      {/* ── Top Bar ── */}
+          {/* ── Top Bar ── */}
       <header className="flex items-center justify-between px-4 py-3 border-b border-gray-800 bg-gray-900/90 backdrop-blur sticky top-0 z-30">
         <button
           onClick={() => router.push('/')}
@@ -924,6 +787,19 @@ export default function RoomPage() {
                   <span>{formatTime(seekMax)}</span>
                 </div>
               </div>
+
+              {/* Gentle inline prompt if browser blocked autoplay */}
+              {isPlaying && !audioUnlocked && (
+                <div className="flex items-center justify-between bg-sky-500/10 border border-sky-500/20 px-3 py-2 rounded-xl text-xs text-sky-300">
+                  <span>🎧 Audio is ready — tap to hear</span>
+                  <button
+                    onClick={handlePlayPause}
+                    className="bg-sky-500 hover:bg-sky-400 text-white font-semibold px-3 py-1 rounded-lg text-xs transition cursor-pointer"
+                  >
+                    Listen Now
+                  </button>
+                </div>
+              )}
 
               {/* Controls */}
               <div className="flex items-center justify-center gap-5">

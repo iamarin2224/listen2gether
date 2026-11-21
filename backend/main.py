@@ -77,12 +77,56 @@ room_state: dict[str, dict[str, Any]] = {}
 # stream_url_cache[video_id] = {"url": str, "headers": dict, "ts": float}
 stream_url_cache: dict[str, dict[str, Any]] = {}
 
+# Coalesce in-flight extraction requests to prevent multiple yt-dlp processes spawning simultaneously
+_in_flight_extractions: dict[str, asyncio.Task] = {}
+
 # room_listeners[room_id] = set of socket session IDs
 room_listeners: dict[str, set[str]] = {}
 
-STREAM_CACHE_TTL = 30 * 60   # 30 minutes in seconds
+STREAM_CACHE_TTL = 15 * 60   # 15 minutes in seconds
 ROOM_INACTIVE_TTL = 2 * 60 * 60  # 2 hours in seconds
 CHUNK_SIZE = 64 * 1024        # 64 KB
+ROOMS_PERSISTENCE_FILE = "/tmp/listen2gether_rooms.json"
+
+# ---------------------------------------------------------------------------
+# Room persistence across process reboots
+# ---------------------------------------------------------------------------
+
+def _save_rooms_to_disk() -> None:
+    try:
+        data = {
+            rid: {
+                "roomId": r["roomId"],
+                "currentTrack": r.get("currentTrack"),
+                "queue": r.get("queue", []),
+                "history": r.get("history", []),
+                "isPlaying": r.get("isPlaying", False),
+                "anchorTime": r.get("anchorTime", 0.0),
+                "anchorTimestamp": r.get("anchorTimestamp", int(time.time() * 1000)),
+                "lastActivity": r.get("lastActivity", time.time()),
+            }
+            for rid, r in room_state.items()
+        }
+        with open(ROOMS_PERSISTENCE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.debug("Failed saving rooms to disk: %s", e)
+
+def _load_rooms_from_disk() -> None:
+    try:
+        if os.path.exists(ROOMS_PERSISTENCE_FILE):
+            with open(ROOMS_PERSISTENCE_FILE, "r") as f:
+                data = json.load(f)
+                now = time.time()
+                for rid, r in data.items():
+                    if (now - r.get("lastActivity", now)) < ROOM_INACTIVE_TTL:
+                        room_state[rid] = r
+            log.info("Restored %d active rooms from persistent storage", len(room_state))
+    except Exception as e:
+        log.debug("Failed loading rooms from disk: %s", e)
+
+# Pre-load existing rooms immediately
+_load_rooms_from_disk()
 
 # ---------------------------------------------------------------------------
 # Helper: room state factory
@@ -104,6 +148,7 @@ def _new_room(room_id: str) -> dict[str, Any]:
 def _touch(room_id: str) -> None:
     if room_id in room_state:
         room_state[room_id]["lastActivity"] = time.time()
+        _save_rooms_to_disk()
 
 
 def _public_state(room_id: str) -> dict[str, Any]:
@@ -143,9 +188,6 @@ async def advance_track(room_id: str) -> None:
         state["isPlaying"] = True
         state["anchorTime"] = 0.0
         state["anchorTimestamp"] = int(time.time() * 1000)
-        # Pre-extract upcoming item in queue if available
-        if state["queue"] and state["queue"][0].get("videoId"):
-            asyncio.create_task(pre_extract_track(state["queue"][0]["videoId"]))
     else:
         state["currentTrack"] = None
         state["isPlaying"] = False
@@ -301,11 +343,6 @@ async def search(q: str = Query(..., min_length=1)) -> JSONResponse:
                 return results
 
         results = await loop.run_in_executor(None, _extract)
-        # Pre-extract stream URLs in background for top 2 search results to make playback instant
-        for item in results[:2]:
-            vid = item.get("videoId")
-            if vid:
-                asyncio.create_task(pre_extract_track(vid))
         return JSONResponse(results)
 
     except Exception as exc:
@@ -315,7 +352,9 @@ async def search(q: str = Query(..., min_length=1)) -> JSONResponse:
 
 def _extract_url_sync(video_id: str) -> tuple[str, dict[str, str]]:
     """Synchronously extract playable stream URL using yt-dlp with multi-tier fallback."""
-    # Strategy 1: Fast audio extraction with mobile/tv/web clients
+    # Strategy 1: Dedicated android/tv client without browser cookies.
+    # Note: Web cookies force yt-dlp to use YouTube's WEB player client, which signs URLs with
+    # SABR/pot tokens that return HTTP 403 Forbidden on direct proxying. Android/TV clients bypass this.
     primary_opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -325,12 +364,10 @@ def _extract_url_sync(video_id: str) -> tuple[str, dict[str, str]]:
         "format": "bestaudio/best",
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "mweb", "tv", "web"]
+                "player_client": ["android", "tv"]
             }
         },
     }
-    if COOKIES_PATH:
-        primary_opts["cookiefile"] = COOKIES_PATH
 
     try:
         with yt_dlp.YoutubeDL(primary_opts) as ydl:
@@ -364,38 +401,35 @@ def _extract_url_sync(video_id: str) -> tuple[str, dict[str, str]]:
 
 
 async def get_or_extract_stream_url(video_id: str) -> tuple[str, dict[str, str]]:
-    """Return cached stream URL or extract a fresh one."""
+    """Return cached stream URL or extract a fresh one, coalescing concurrent requests."""
     cached = stream_url_cache.get(video_id)
     now = time.time()
     if cached and (now - cached["ts"]) < STREAM_CACHE_TTL:
         log.debug("Cache hit for video_id=%s", video_id)
         return cached["url"], cached.get("extra_headers", {})
 
-    log.info("Extracting stream URL for video_id=%s", video_id)
-    loop = asyncio.get_event_loop()
-    upstream_url, upstream_headers = await loop.run_in_executor(None, _extract_url_sync, video_id)
+    # If extraction is already in progress, await the existing task
+    if video_id in _in_flight_extractions:
+        log.info("Awaiting existing in-flight extraction for video_id=%s", video_id)
+        return await _in_flight_extractions[video_id]
 
-    stream_url_cache[video_id] = {
-        "url": upstream_url,
-        "extra_headers": upstream_headers,
-        "ts": time.time(),
-    }
-    return upstream_url, upstream_headers
+    async def _do_extract() -> tuple[str, dict[str, str]]:
+        log.info("Starting single-flight extraction for video_id=%s", video_id)
+        loop = asyncio.get_event_loop()
+        upstream_url, upstream_headers = await loop.run_in_executor(None, _extract_url_sync, video_id)
+        stream_url_cache[video_id] = {
+            "url": upstream_url,
+            "extra_headers": upstream_headers,
+            "ts": time.time(),
+        }
+        return upstream_url, upstream_headers
 
-
-async def pre_extract_track(video_id: str) -> None:
-    """Pre-resolve a video stream URL in the background before the user taps play."""
+    task = asyncio.create_task(_do_extract())
+    _in_flight_extractions[video_id] = task
     try:
-        if not video_id:
-            return
-        cached = stream_url_cache.get(video_id)
-        if cached and (time.time() - cached["ts"]) < STREAM_CACHE_TTL:
-            return
-        log.info("Background pre-extracting stream URL for %s", video_id)
-        await get_or_extract_stream_url(video_id)
-        log.info("Background pre-extraction completed for %s", video_id)
-    except Exception as e:
-        log.debug("Background pre-extraction failed for %s: %s", video_id, e)
+        return await task
+    finally:
+        _in_flight_extractions.pop(video_id, None)
 
 
 @app.get("/api/stream/{video_id}")
@@ -433,6 +467,35 @@ async def stream_audio(video_id: str, request: Request) -> StreamingResponse:
         upstream_resp = await client.send(upstream_req, stream=True)
 
         status_code = upstream_resp.status_code
+
+        # If Google Video returned 403 Forbidden or 410 Gone, the cached stream URL is invalid/expired.
+        # Evict cache, extract fresh stream URL, and retry immediately once!
+        if status_code in (403, 410):
+            log.warning("Upstream returned %d for %s. Evicting cache and re-extracting fresh URL...", status_code, video_id)
+            await upstream_resp.aclose()
+            stream_url_cache.pop(video_id, None)
+
+            upstream_url, upstream_headers = await get_or_extract_stream_url(video_id)
+            req_headers["User-Agent"] = (
+                upstream_headers.get("User-Agent")
+                or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+            )
+            for key in ("Referer", "Origin"):
+                if key in upstream_headers:
+                    req_headers[key] = upstream_headers[key]
+
+            upstream_req = client.build_request("GET", upstream_url, headers=req_headers)
+            upstream_resp = await client.send(upstream_req, stream=True)
+            status_code = upstream_resp.status_code
+            log.info("Retry for %s returned status %d", video_id, status_code)
+
+        if status_code in (403, 410):
+            # Still failed after re-extraction; evict so next attempt starts clean
+            stream_url_cache.pop(video_id, None)
+            await upstream_resp.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=502, detail=f"YouTube upstream stream returned {status_code}")
+
         raw_content_type = upstream_resp.headers.get("Content-Type", "audio/mp4")
         # Ensure browsers/iOS treat the stream as pure audio even if format 18 (mp4) container is returned
         content_type = "audio/mp4" if raw_content_type.startswith("video/") else raw_content_type
@@ -451,6 +514,10 @@ async def stream_audio(video_id: str, request: Request) -> StreamingResponse:
             try:
                 async for chunk in upstream_resp.aiter_bytes(chunk_size=CHUNK_SIZE):
                     yield chunk
+            except (asyncio.CancelledError, GeneratorExit):
+                pass
+            except Exception as e:
+                log.debug("Stream aborted by client for %s: %s", video_id, e)
             finally:
                 await upstream_resp.aclose()
                 await client.aclose()
@@ -505,15 +572,10 @@ async def on_join_room(sid: str, data: dict) -> None:
         await sio.emit("error", {"message": "roomId is required"}, to=sid)
         return
 
-    # Check if room exists
+    # Check if room exists or auto-initialize
     if room_id not in room_state:
-        if is_create:
-            room_state[room_id] = _new_room(room_id)
-            log.info("Room created: %s", room_id)
-        else:
-            log.warning("Non-existent room access: %s", room_id)
-            await sio.emit("room_not_found", {"roomId": room_id}, to=sid)
-            return
+        room_state[room_id] = _new_room(room_id)
+        log.info("Room auto-initialized: %s", room_id)
 
     await sio.enter_room(sid, room_id)
     room_listeners.setdefault(room_id, set()).add(sid)
@@ -525,11 +587,6 @@ async def on_join_room(sid: str, data: dict) -> None:
     await sio.emit("room_state", _public_state(room_id), to=sid)
     # Broadcast updated listener count to everyone in the room
     await sio.emit("room_state", _public_state(room_id), room=room_id)
-
-    # Pre-extract active track so joining clients start streaming immediately
-    curr_track = room_state.get(room_id, {}).get("currentTrack")
-    if curr_track and curr_track.get("videoId"):
-        asyncio.create_task(pre_extract_track(curr_track["videoId"]))
 
 
 @sio.on("leave_room")
@@ -655,10 +712,6 @@ async def on_play_now(sid: str, data: dict) -> None:
     log.info("room=%s play_now track %s (remaining queue: %d)", room_id, track.get("videoId"), len(state["queue"]))
     await sio.emit("room_state", _public_state(room_id), room=room_id)
 
-    # Pre-extract next track in queue in the background
-    if state["queue"] and state["queue"][0].get("videoId"):
-        asyncio.create_task(pre_extract_track(state["queue"][0]["videoId"]))
-
 
 @sio.on("track_started")
 async def on_track_started(sid: str, data: dict) -> None:
@@ -714,9 +767,6 @@ async def on_add_to_queue(sid: str, data: dict) -> None:
             "room=%s queued track %s (queue len=%d)",
             room_id, track.get("videoId"), len(state["queue"]),
         )
-
-    # Immediately pre-extract the queued track stream URL in the background
-    asyncio.create_task(pre_extract_track(track["videoId"]))
 
     _touch(room_id)
     await sio.emit("room_state", _public_state(room_id), room=room_id)
@@ -809,7 +859,7 @@ async def on_move_queue_item(sid: str, data: dict) -> None:
 async def on_track_ended(sid: str, data: dict) -> None:
     """
     Idempotent: only advance if the reported videoId matches currentTrack.
-    data: { roomId: str, videoId: str }
+    Guards against premature track_ended events from browser buffer errors.
     """
     room_id: str = data.get("roomId", "").strip().upper()
     state = room_state.get(room_id)
@@ -826,6 +876,16 @@ async def on_track_ended(sid: str, data: dict) -> None:
         log.info(
             "room=%s track_ended ignored: reported=%s current=%s",
             room_id, reported_id, current.get("videoId"),
+        )
+        return
+
+    # Guard: ignore premature track_ended if track has played for less than 8s
+    elapsed = (time.time() * 1000 - state.get("anchorTimestamp", 0)) / 1000.0
+    duration = current.get("duration") or 60.0
+    if elapsed < 8.0 and elapsed < (duration * 0.7):
+        log.warning(
+            "room=%s premature track_ended ignored: elapsed=%.1fs, duration=%s",
+            room_id, elapsed, duration,
         )
         return
 
