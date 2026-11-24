@@ -59,6 +59,7 @@ export default function RoomPage() {
   const [searchResults, setSearchResults] = useState<Track[]>([]);
   const [connStatus, setConnStatus] = useState<ConnStatus>('connecting');
   const [audioUnlocked, setAudioUnlocked] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false);
@@ -84,7 +85,7 @@ export default function RoomPage() {
   useEffect(() => { isSeekingRef.current = isSeeking; }, [isSeeking]);
   useEffect(() => { audioUnlockedRef.current = audioUnlocked; }, [audioUnlocked]);
 
-  // Continuous timer to advance slider smoothly even before local audio finishes buffering
+  // Continuous timer to advance slider smoothly
   useEffect(() => {
     const timer = setInterval(() => {
       const audio = audioRef.current;
@@ -97,8 +98,13 @@ export default function RoomPage() {
         if (!state.isPlaying) {
           setCurrentTime(state.anchorTime);
         } else {
-          const elapsed = (Date.now() - state.anchorTimestamp) / 1000;
-          setCurrentTime(state.anchorTime + elapsed);
+          // If local audio has not buffered yet and is at 0, hold slider at anchorTime
+          if (audio && audio.currentTime === 0 && audio.paused) {
+            setCurrentTime(state.anchorTime);
+          } else {
+            const elapsed = (Date.now() - state.anchorTimestamp) / 1000;
+            setCurrentTime(state.anchorTime + elapsed);
+          }
         }
       }
     }, 250);
@@ -117,6 +123,7 @@ export default function RoomPage() {
     (track: Track, autoplay: boolean, startAt = 0) => {
       const audio = audioRef.current;
       if (!audio) return;
+      setIsBuffering(true);
       const src = `${backendUrl}/api/stream/${track.videoId}`;
       if (audio.src !== src) {
         audio.src = src;
@@ -340,9 +347,26 @@ export default function RoomPage() {
       if (audio) setDuration(audio.duration);
     }
 
+    function onWaiting() {
+      setIsBuffering(true);
+    }
+
     function onPlaying() {
+      setIsBuffering(false);
       setAudioUnlocked(true);
       audioUnlockedRef.current = true;
+
+      const state = roomStateRef.current;
+      if (state && state.currentTrack && audio) {
+        // If track is starting near 0, notify server so room timeline aligns with real audio!
+        if (audio.currentTime < 5.0) {
+          socketRef.current?.emit('track_started', {
+            roomId,
+            videoId: state.currentTrack.videoId,
+            currentTime: audio.currentTime,
+          });
+        }
+      }
     }
 
     function onEnded() {
@@ -374,6 +398,7 @@ export default function RoomPage() {
     }
 
     function onCanPlay() {
+      setIsBuffering(false);
       const state = roomStateRef.current;
       if (!state || !state.isPlaying || !state.currentTrack || !audio) return;
       const target = computeTargetTime(state);
@@ -399,6 +424,7 @@ export default function RoomPage() {
     }
 
     function onError() {
+      setIsBuffering(false);
       const err = audio!.error;
       console.error('[Audio] Native playback error on audio element:', err?.code, err?.message, 'src:', audio!.src);
       // Automatically recover after transient network, proxy, or 403 error
@@ -422,6 +448,7 @@ export default function RoomPage() {
 
     audio.addEventListener('timeupdate', onTimeUpdate);
     audio.addEventListener('durationchange', onDurationChange);
+    audio.addEventListener('waiting', onWaiting);
     audio.addEventListener('playing', onPlaying);
     audio.addEventListener('ended', onEnded);
     audio.addEventListener('error', onError);
@@ -430,6 +457,7 @@ export default function RoomPage() {
     return () => {
       audio.removeEventListener('timeupdate', onTimeUpdate);
       audio.removeEventListener('durationchange', onDurationChange);
+      audio.removeEventListener('waiting', onWaiting);
       audio.removeEventListener('playing', onPlaying);
       audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('error', onError);
@@ -522,6 +550,36 @@ export default function RoomPage() {
     socketRef.current?.emit('add_to_queue', { roomId, track });
   }
 
+  function handleUnlockLocalAudio() {
+    if (!roomState || !roomState.currentTrack) return;
+    setupAudioSession();
+    setAudioUnlocked(true);
+    audioUnlockedRef.current = true;
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const targetSrc = `${backendUrl}/api/stream/${roomState.currentTrack.videoId}`;
+    const target = computeTargetTime(roomState);
+
+    if (audio.error || !audio.src || !audio.src.includes(roomState.currentTrack.videoId)) {
+      audio.src = targetSrc;
+      audio.load();
+    }
+    if (Math.abs(audio.currentTime - target) > 1.0) {
+      try {
+        audio.currentTime = target;
+      } catch {}
+    }
+    audio.play().catch((err) => {
+      console.warn('[Audio] Unlock local play error:', err);
+      if (err?.name === 'NotSupportedError') {
+        audio.src = `${targetSrc}?r=${Date.now()}`;
+        audio.load();
+        audio.play().catch(() => {});
+      }
+    });
+  }
+
   function handlePlayPause() {
     if (!roomState) return;
 
@@ -531,46 +589,31 @@ export default function RoomPage() {
 
     const audio = audioRef.current;
 
-    // If the room is currently playing, but this device's audio is paused locally (e.g. browser autoplay restriction):
-    // Start local playback without toggling/pausing the entire room!
-    if (audio && audio.paused && roomState.isPlaying && roomState.currentTrack) {
-      console.log('[Audio] Resuming local playback to join ongoing room audio');
-      const targetSrc = `${backendUrl}/api/stream/${roomState.currentTrack.videoId}`;
-      const target = computeTargetTime(roomState);
-
-      // If audio has an error, has no source, or wrong source: cleanly re-assign and load
-      if (audio.error || !audio.src || !audio.src.includes(roomState.currentTrack.videoId)) {
-        console.log('[Audio] Reloading fresh source on audio element to recover');
-        audio.src = targetSrc;
-        audio.load();
+    if (roomState.isPlaying) {
+      // Pause room
+      if (audio) {
+        audio.pause();
       }
-
-      if (Math.abs(audio.currentTime - target) > 1.0) {
-        try {
-          audio.currentTime = target;
-        } catch {}
-      }
-      audio.play().catch((err) => {
-        console.warn('[Audio] Local play error:', err);
-        // Force recovery reload if play rejected due to unsupported/stale source
-        if (err?.name === 'NotSupportedError') {
-          audio.src = `${targetSrc}?r=${Date.now()}`;
-          audio.load();
-          audio.play().catch(() => {});
-        }
+      socketRef.current?.emit('play_pause', {
+        roomId,
+        action: 'pause',
       });
-      return;
+    } else {
+      // Play room
+      if (audio && roomState.currentTrack) {
+        const targetSrc = `${backendUrl}/api/stream/${roomState.currentTrack.videoId}`;
+        if (!audio.src || !audio.src.includes(roomState.currentTrack.videoId)) {
+          audio.src = targetSrc;
+          audio.load();
+        }
+        const p = audio.play();
+        if (p !== undefined) p.catch(() => {});
+      }
+      socketRef.current?.emit('play_pause', {
+        roomId,
+        action: 'play',
+      });
     }
-
-    if (audio && !roomState.isPlaying) {
-      const p = audio.play();
-      if (p !== undefined) p.catch(() => {});
-    }
-
-    socketRef.current?.emit('play_pause', {
-      roomId,
-      action: roomState.isPlaying ? 'pause' : 'play',
-    });
   }
 
   function handlePrevious() {
@@ -761,9 +804,9 @@ export default function RoomPage() {
                   </p>
                   <p className="text-xs text-gray-400 mt-1 truncate">{track.artist}</p>
                   <div className="flex items-center gap-2 mt-1.5">
-                    <MusicWaveIcon playing={isPlaying} />
+                    <MusicWaveIcon playing={isPlaying && !isBuffering} />
                     <span className="text-xs text-gray-500">
-                      {isPlaying ? 'Playing' : 'Paused'}
+                      {isBuffering && isPlaying ? 'Buffering…' : isPlaying ? 'Playing' : 'Paused'}
                     </span>
                   </div>
                 </div>
@@ -793,7 +836,7 @@ export default function RoomPage() {
                 <div className="flex items-center justify-between bg-sky-500/10 border border-sky-500/20 px-3 py-2 rounded-xl text-xs text-sky-300">
                   <span>🎧 Audio is ready — tap to hear</span>
                   <button
-                    onClick={handlePlayPause}
+                    onClick={handleUnlockLocalAudio}
                     className="bg-sky-500 hover:bg-sky-400 text-white font-semibold px-3 py-1 rounded-lg text-xs transition cursor-pointer"
                   >
                     Listen Now
@@ -821,7 +864,12 @@ export default function RoomPage() {
                   className="w-14 h-14 rounded-full bg-sky-500 hover:bg-sky-400 active:bg-sky-600 flex items-center justify-center shadow-lg shadow-sky-900/50 transition-colors cursor-pointer"
                   aria-label={isPlaying ? 'Pause' : 'Play'}
                 >
-                  {isPlaying ? (
+                  {isBuffering && isPlaying ? (
+                    <svg className="w-6 h-6 text-white animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                    </svg>
+                  ) : isPlaying ? (
                     <svg className="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24">
                       <rect x="6" y="4" width="4" height="16" rx="1" />
                       <rect x="14" y="4" width="4" height="16" rx="1" />

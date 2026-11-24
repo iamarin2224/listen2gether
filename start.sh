@@ -18,12 +18,11 @@ fi
 
 # Detect Python virtualenv executable
 PYTHON_BIN="python3"
-UVICORN_BIN="uvicorn"
 
-if [ -f "$BACKEND_DIR/venv/bin/uvicorn" ]; then
-    UVICORN_BIN="$BACKEND_DIR/venv/bin/uvicorn"
-elif [ -f "$BACKEND_DIR/.venv/bin/uvicorn" ]; then
-    UVICORN_BIN="$BACKEND_DIR/.venv/bin/uvicorn"
+if [ -f "$BACKEND_DIR/venv/bin/python" ]; then
+    PYTHON_BIN="$BACKEND_DIR/venv/bin/python"
+elif [ -f "$BACKEND_DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$BACKEND_DIR/.venv/bin/python"
 fi
 
 echo "=========================================================="
@@ -49,8 +48,8 @@ trap cleanup SIGINT SIGTERM EXIT
 # Ensure fresh Next.js dev cache
 rm -rf "$FRONTEND_DIR/.next" 2>/dev/null || true
 
-# Start backend on port 8000
-(cd "$BACKEND_DIR" && "$UVICORN_BIN" main:socket_app --reload --host 0.0.0.0 --port 8000) &
+# Start backend on port 8000 using virtualenv python directly
+(cd "$BACKEND_DIR" && "$PYTHON_BIN" -m uvicorn main:socket_app --reload --host 0.0.0.0 --port 8000) &
 BACKEND_PID=$!
 
 # Start Next.js on port 3001

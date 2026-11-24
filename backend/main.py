@@ -188,11 +188,16 @@ async def advance_track(room_id: str) -> None:
         state["isPlaying"] = True
         state["anchorTime"] = 0.0
         state["anchorTimestamp"] = int(time.time() * 1000)
+        state["_started"] = False
+        # Pre-extract next track in queue if available
+        if state["queue"] and state["queue"][0].get("videoId"):
+            asyncio.create_task(safe_pre_extract(state["queue"][0]["videoId"]))
     else:
         state["currentTrack"] = None
         state["isPlaying"] = False
         state["anchorTime"] = 0.0
         state["anchorTimestamp"] = int(time.time() * 1000)
+        state["_started"] = False
 
     _touch(room_id)
     await sio.emit("room_state", _public_state(room_id), room=room_id)
@@ -343,6 +348,9 @@ async def search(q: str = Query(..., min_length=1)) -> JSONResponse:
                 return results
 
         results = await loop.run_in_executor(None, _extract)
+        # Pre-extract top search result in background so playback starts instantly on click
+        if results and results[0].get("videoId"):
+            asyncio.create_task(safe_pre_extract(results[0]["videoId"]))
         return JSONResponse(results)
 
     except Exception as exc:
@@ -430,6 +438,30 @@ async def get_or_extract_stream_url(video_id: str) -> tuple[str, dict[str, str]]
         return await task
     finally:
         _in_flight_extractions.pop(video_id, None)
+
+
+# Limit background pre-extractions to at most 1 at a time to prevent memory spikes on free tier
+_pre_extract_sem = asyncio.Semaphore(1)
+
+
+async def safe_pre_extract(video_id: str) -> None:
+    """Pre-resolve a video stream URL in the background before the user taps play."""
+    if not video_id:
+        return
+    cached = stream_url_cache.get(video_id)
+    if cached and (time.time() - cached["ts"]) < STREAM_CACHE_TTL:
+        return
+    try:
+        async with _pre_extract_sem:
+            # Re-check cache after acquiring semaphore
+            cached = stream_url_cache.get(video_id)
+            if cached and (time.time() - cached["ts"]) < STREAM_CACHE_TTL:
+                return
+            log.info("Background pre-extracting stream URL for %s", video_id)
+            await get_or_extract_stream_url(video_id)
+            log.info("Background pre-extraction ready for %s", video_id)
+    except Exception as e:
+        log.debug("Pre-extraction skipped for %s: %s", video_id, e)
 
 
 @app.get("/api/stream/{video_id}")
@@ -708,9 +740,14 @@ async def on_play_now(sid: str, data: dict) -> None:
     state["isPlaying"] = True
     state["anchorTime"] = 0.0
     state["anchorTimestamp"] = int(time.time() * 1000)
+    state["_started"] = False
     _touch(room_id)
     log.info("room=%s play_now track %s (remaining queue: %d)", room_id, track.get("videoId"), len(state["queue"]))
     await sio.emit("room_state", _public_state(room_id), room=room_id)
+
+    # Pre-extract next track in queue if available
+    if state["queue"] and state["queue"][0].get("videoId"):
+        asyncio.create_task(safe_pre_extract(state["queue"][0]["videoId"]))
 
 
 @sio.on("track_started")
@@ -730,8 +767,9 @@ async def on_track_started(sid: str, data: dict) -> None:
         return
 
     current_time = float(data.get("currentTime", 0.0))
-    # Re-anchor if track is near start and anchor was 0
-    if state["anchorTime"] <= 1.0 and current_time < 3.0:
+    # Re-anchor once when playback actually begins on client
+    if not state.get("_started") and current_time < 5.0:
+        state["_started"] = True
         state["anchorTime"] = current_time
         state["anchorTimestamp"] = int(time.time() * 1000)
         _touch(room_id)
@@ -760,6 +798,7 @@ async def on_add_to_queue(sid: str, data: dict) -> None:
         state["isPlaying"] = True
         state["anchorTime"] = 0.0
         state["anchorTimestamp"] = int(time.time() * 1000)
+        state["_started"] = False
         log.info("room=%s auto-playing track %s", room_id, track.get("videoId"))
     else:
         state["queue"].append(track)
@@ -767,6 +806,9 @@ async def on_add_to_queue(sid: str, data: dict) -> None:
             "room=%s queued track %s (queue len=%d)",
             room_id, track.get("videoId"), len(state["queue"]),
         )
+        # Pre-extract next track up in queue if it's the only one waiting
+        if len(state["queue"]) == 1:
+            asyncio.create_task(safe_pre_extract(track["videoId"]))
 
     _touch(room_id)
     await sio.emit("room_state", _public_state(room_id), room=room_id)
