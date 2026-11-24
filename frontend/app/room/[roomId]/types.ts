@@ -14,4 +14,5 @@ export interface RoomState {
   anchorTime: number;      // seconds into the track
   anchorTimestamp: number; // epoch ms when anchorTime was set
   listeners: string[];     // list of display names / socket IDs
+  _started?: boolean;      // whether audio playback has actually started sound output
 }

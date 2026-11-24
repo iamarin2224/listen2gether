@@ -95,11 +95,12 @@ export default function RoomPage() {
       if (audio && !audio.paused && audio.currentTime > 0) {
         setCurrentTime(audio.currentTime);
       } else if (state?.isPlaying && state.currentTrack) {
-        if (!state.isPlaying) {
+        if (!state.isPlaying || !state._started) {
+          // Track is paused or still buffering before first sound: freeze slider at anchorTime (0:00)
           setCurrentTime(state.anchorTime);
         } else {
-          // If local audio has not buffered yet and is at 0, hold slider at anchorTime
-          if (audio && audio.currentTime === 0 && audio.paused) {
+          // If local audio is still buffering at 0:00, hold slider at anchorTime
+          if (audio && (audio.currentTime === 0 || audio.readyState < 3)) {
             setCurrentTime(state.anchorTime);
           } else {
             const elapsed = (Date.now() - state.anchorTimestamp) / 1000;
@@ -114,6 +115,9 @@ export default function RoomPage() {
   // ── Compute target playback position ──
   const computeTargetTime = useCallback((state: RoomState): number => {
     if (!state.isPlaying) return state.anchorTime;
+    // If the track hasn't actually started playing sound yet (stream extraction / initial buffering),
+    // do NOT advance target time into the future!
+    if (state.currentTrack && !state._started) return state.anchorTime;
     const elapsed = (Date.now() - state.anchorTimestamp) / 1000;
     return state.anchorTime + elapsed;
   }, []);
@@ -185,8 +189,8 @@ export default function RoomPage() {
 
       const targetTime = computeTargetTime(state);
 
-      // Correct drift > 1.2 s (only if audio is ready to seek and not scrubbing)
-      if (audio.readyState >= 2 && !isSeekingRef.current) {
+      // Correct drift > 1.2 s (only if audio is ready to seek, track has started, and not scrubbing)
+      if (state._started && audio.readyState >= 2 && !isSeekingRef.current) {
         const drift = Math.abs(audio.currentTime - targetTime);
         if (drift > 1.2) {
           try {
@@ -358,8 +362,8 @@ export default function RoomPage() {
 
       const state = roomStateRef.current;
       if (state && state.currentTrack && audio) {
-        // If track is starting near 0, notify server so room timeline aligns with real audio!
-        if (audio.currentTime < 5.0) {
+        // If track is not yet marked started on server, or near 0, notify server immediately!
+        if (!state._started || audio.currentTime < 5.0) {
           socketRef.current?.emit('track_started', {
             roomId,
             videoId: state.currentTrack.videoId,
@@ -401,11 +405,15 @@ export default function RoomPage() {
       setIsBuffering(false);
       const state = roomStateRef.current;
       if (!state || !state.isPlaying || !state.currentTrack || !audio) return;
-      const target = computeTargetTime(state);
-      if (Math.abs(audio.currentTime - target) > 1.2) {
-        try {
-          audio.currentTime = target;
-        } catch {}
+
+      // Only seek forward if the track has already started playing in the room!
+      if (state._started) {
+        const target = computeTargetTime(state);
+        if (Math.abs(audio.currentTime - target) > 1.2) {
+          try {
+            audio.currentTime = target;
+          } catch {}
+        }
       }
       if (audio.paused) {
         const p = audio.play();
@@ -494,6 +502,7 @@ export default function RoomPage() {
     setupAudioSession();
     setAudioUnlocked(true);
     audioUnlockedRef.current = true;
+    setCurrentTime(0);
 
     // Immediately load and play the track on this device within the user gesture!
     loadTrack(track, true, 0);
@@ -507,6 +516,7 @@ export default function RoomPage() {
             isPlaying: true,
             anchorTime: 0,
             anchorTimestamp: Date.now(),
+            _started: false,
             queue: prev.queue.filter((q) => q.videoId !== track.videoId),
           }
         : null
@@ -521,6 +531,7 @@ export default function RoomPage() {
     setupAudioSession();
     setAudioUnlocked(true);
     audioUnlockedRef.current = true;
+    setCurrentTime(0);
 
     // Immediately load and play the track on this device within the user gesture!
     loadTrack(track, true, 0);
@@ -534,6 +545,7 @@ export default function RoomPage() {
             isPlaying: true,
             anchorTime: 0,
             anchorTimestamp: Date.now(),
+            _started: false,
             queue: prev.queue.filter((_, i) => i !== index),
           }
         : null

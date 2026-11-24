@@ -104,6 +104,7 @@ def _save_rooms_to_disk() -> None:
                 "anchorTime": r.get("anchorTime", 0.0),
                 "anchorTimestamp": r.get("anchorTimestamp", int(time.time() * 1000)),
                 "lastActivity": r.get("lastActivity", time.time()),
+                "_started": r.get("_started", False),
             }
             for rid, r in room_state.items()
         }
@@ -142,6 +143,7 @@ def _new_room(room_id: str) -> dict[str, Any]:
         "anchorTime": 0.0,
         "anchorTimestamp": int(time.time() * 1000),
         "lastActivity": time.time(),
+        "_started": False,
     }
 
 
@@ -661,8 +663,11 @@ async def on_play_pause(sid: str, data: dict) -> None:
         elif action == "pause":
             # calculate elapsed
             if state["isPlaying"]:
-                elapsed = (time.time() * 1000 - state["anchorTimestamp"]) / 1000.0
-                state["anchorTime"] += elapsed
+                if state.get("_started"):
+                    elapsed = (time.time() * 1000 - state["anchorTimestamp"]) / 1000.0
+                    state["anchorTime"] += elapsed
+                else:
+                    state["anchorTime"] = 0.0
             state["isPlaying"] = False
             state["anchorTimestamp"] = int(time.time() * 1000)
         else:
@@ -697,6 +702,7 @@ async def on_seek(sid: str, data: dict) -> None:
 
     state["anchorTime"] = max(0.0, float(target_time))
     state["anchorTimestamp"] = int(time.time() * 1000)
+    state["_started"] = True
     if "isPlaying" in data:
         state["isPlaying"] = bool(data["isPlaying"])
     _touch(room_id)
